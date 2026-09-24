@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Unified Stream Chat</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<header id="topbar">
+  <div class="brand">Unified Chat</div>
+  <div id="platform-status" aria-label="Connection status"></div>
+  <div class="spacer"></div>
+  <button id="tts-toggle" class="icon-btn" title="Mute / unmute text-to-speech" aria-pressed="false"></button>
+  <button id="tts-skip" class="icon-btn" title="Skip current message">&#x23ED;</button>
+  <button id="settings-btn" class="icon-btn" title="Settings" aria-controls="settings">&#9881;</button>
+</header>
+
+<div id="audio-unlock" hidden>Click here to enable text-to-speech audio</div>
+
+<main id="chat" aria-live="polite"></main>
+<button id="scroll-resume" hidden>&#x2193; New messages</button>
+
+<aside id="settings" aria-hidden="true">
+  <div class="settings-head">
+    <h2>Settings</h2>
+    <span id="save-state"></span>
+    <button id="settings-close" class="icon-btn" title="Close">&#x2715;</button>
+  </div>
+  <nav class="tabs" role="tablist">
+    <button role="tab" data-tab="connections" class="active">Connections</button>
+    <button role="tab" data-tab="chat">Chat</button>
+    <button role="tab" data-tab="translation">Translation</button>
+    <button role="tab" data-tab="tts">Voice (TTS)</button>
+    <button role="tab" data-tab="advanced">Advanced</button>
+  </nav>
+
+  <div class="tab-body">
+    <!-- ================= CONNECTIONS ================= -->
+    <section data-panel="connections" class="panel active">
+      <div class="card platform-card" data-platform="twitch">
+        <div class="card-head"><span class="logo" data-logo="twitch"></span><h3>Twitch</h3>
+          <span class="pill" data-status="twitch">disabled</span>
+          <label class="switch"><input type="checkbox" data-key="twitch.enabled"><span></span></label></div>
+        <p class="account" data-account="twitch"></p>
+        <div class="btn-row">
+          <button class="primary" data-login="twitch">Login with Twitch</button>
+          <button data-logout="twitch">Logout</button>
+          <button data-reconnect="twitch">Reconnect</button>
+        </div>
+        <details>
+          <summary>API credentials &amp; channel</summary>
+          <label>Client ID<input type="text" data-key="twitch.clientId" autocomplete="off" spellcheck="false"></label>
+          <label>Client Secret<input type="password" data-key="twitch.clientSecret" autocomplete="off"></label>
+          <label>Channel <small>(empty = your own channel)</small><input type="text" data-key="twitch.channel" placeholder="channel name"></label>
+          <p class="hint">Register an app at dev.twitch.tv/console with this OAuth Redirect URL:</p>
+          <div class="copy-row"><code data-redirect="twitch"></code><button data-copy="twitch">Copy</button></div>
+        </details>
+      </div>
+
+      <div class="card platform-card" data-platform="youtube">
+        <div class="card-head"><span class="logo" data-logo="youtube"></span><h3>YouTube</h3>
+          <span class="pill" data-status="youtube">disabled</span>
+          <label class="switch"><input type="checkbox" data-key="youtube.enabled"><span></span></label></div>
+        <p class="account" data-account="youtube"></p>
+        <div class="btn-row">
+          <button class="primary" data-login="youtube">Login with YouTube</button>
+          <button data-logout="youtube">Logout</button>
+          <button data-reconnect="youtube">Reconnect</button>
+        </div>
+        <details>
+          <summary>API credentials &amp; stream</summary>
+          <label>OAuth Client ID<input type="text" data-key="youtube.clientId" autocomplete="off" spellcheck="false"></label>
+          <label>OAuth Client Secret<input type="password" data-key="youtube.clientSecret" autocomplete="off"></label>
+          <label>Video ID / URL <small>(empty = your active live stream)</small><input type="text" data-key="youtube.videoId" placeholder="https://youtube.com/live/..."></label>
+          <label>Minimum poll interval (ms)<input type="number" min="2000" step="500" data-key="youtube.minPollMs"></label>
+          <label class="check"><input type="checkbox" data-key="youtube.showBacklog"> Show recent messages on connect</label>
+          <p class="hint">Create a "Desktop app" OAuth client in Google Cloud Console (YouTube Data API v3 enabled). Redirect URL:</p>
+          <div class="copy-row"><code data-redirect="youtube"></code><button data-copy="youtube">Copy</button></div>
+        </details>
+      </div>
+
+      <div class="card platform-card" data-platform="kick">
+        <div class="card-head"><span class="logo" data-logo="kick"></span><h3>Kick</h3>
+          <span class="pill" data-status="kick">disabled</span>
+          <label class="switch"><input type="checkbox" data-key="kick.enabled"><span></span></label></div>
+        <label>Kick username<input type="text" data-key="kick.username" placeholder="your channel name" spellcheck="false"></label>
+        <div class="btn-row"><button data-reconnect="kick">Reconnect</button></div>
+        <details>
+          <summary>Troubleshooting</summary>
+          <label>Chatroom ID <small>(only if the lookup is blocked)</small><input type="text" data-key="kick.chatroomId" placeholder="auto"></label>
+          <label>Pusher key<input type="text" data-key="kick.pusherKey" spellcheck="false"></label>
+          <label>Pusher cluster<input type="text" data-key="kick.pusherCluster" spellcheck="false"></label>
+        </details>
+      </div>
+      <p class="status-line" data-detail></p>
+    </section>
+
+    <!-- ================= CHAT DISPLAY ================= -->
+    <section data-panel="chat" class="panel">
+      <div class="card">
+        <h4>Appearance</h4>
+        <label>Theme<select data-key="ui.theme">
+          <option value="dark">Dark</option><option value="light">Light</option><option value="transparent">Transparent</option>
+        </select></label>
+        <label>Font size <output data-out="ui.fontSize"></output><input type="range" min="11" max="28" data-key="ui.fontSize"></label>
+        <label>Max messages kept<input type="number" min="20" max="1000" data-key="ui.maxMessages"></label>
+        <label class="check"><input type="checkbox" data-key="ui.animate"> Animate new messages</label>
+      </div>
+      <div class="card">
+        <h4>Platform identity</h4>
+        <label class="check"><input type="checkbox" data-key="ui.showLogos"> Show platform logo next to names</label>
+        <label class="check"><input type="checkbox" data-key="ui.showPlatformColors"> Show platform color code</label>
+        <label class="check"><input type="checkbox" data-key="ui.useUserColors"> Use each user's own name color</label>
+        <label class="check"><input type="checkbox" data-key="ui.showBadges"> Show role badges (mod, sub, VIP...)</label>
+        <label class="check"><input type="checkbox" data-key="ui.showTimestamps"> Show timestamps</label>
+        <div class="color-row">
+          <label><span class="logo" data-logo="twitch"></span>Twitch<input type="color" data-key="ui.colors.twitch"></label>
+          <label><span class="logo" data-logo="youtube"></span>YouTube<input type="color" data-key="ui.colors.youtube"></label>
+          <label><span class="logo" data-logo="kick"></span>Kick<input type="color" data-key="ui.colors.kick"></label>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= TRANSLATION ================= -->
+    <section data-panel="translation" class="panel">
+      <div class="card">
+        <div class="card-head"><h4>Google Translate</h4>
+          <label class="switch"><input type="checkbox" data-key="translation.enabled"><span></span></label></div>
+        <label>Translate into<select data-key="translation.targetLang" data-langs></select></label>
+        <label class="check"><input type="checkbox" data-key="translation.showForEnglish"> English messages: show translated line below</label>
+        <label class="check"><input type="checkbox" data-key="translation.showForAllLanguages"> Also translate every other foreign language</label>
+        <p class="hint">Example: an English message stays as-is, with an Arabic line displayed right under it.</p>
+      </div>
+      <div class="card">
+        <h4>Google Cloud (optional)</h4>
+        <label>API key<input type="password" data-key="google.apiKey" autocomplete="off" placeholder="empty = free Google endpoints"></label>
+        <p class="hint">Without a key, the free Google Translate / Translate-TTS endpoints are used. With a key, Cloud Translation v2 and Cloud Text-to-Speech are used (more reliable, better voices).</p>
+      </div>
+    </section>
+
+    <!-- ================= TTS ================= -->
+    <section data-panel="tts" class="panel">
+      <div class="card">
+        <div class="card-head"><h4>Text-to-Speech</h4>
+          <label class="switch"><input type="checkbox" data-key="tts.enabled"><span></span></label></div>
+        <label class="check"><input type="checkbox" data-key="tts.readUsername"> Read the username</label>
+        <label>Username phrase <small>({user} = name)</small><input type="text" data-key="tts.usernameTemplate" placeholder="{user}:"></label>
+        <label class="check"><input type="checkbox" data-key="tts.readMessage"> Read the message text</label>
+        <label>Reading mode<select data-key="tts.mode">
+          <option value="original">Read as-is (original language)</option>
+          <option value="translated">Read the translated text</option>
+        </select></label>
+        <button id="tts-test">&#9654; Test voice</button>
+      </div>
+      <div class="card">
+        <h4>Filters</h4>
+        <label>Skip messages longer than (characters, 0 = never)<input type="number" min="0" max="2000" data-key="tts.maxChars"></label>
+        <label class="check"><input type="checkbox" data-key="tts.skipCommands"> Skip !commands</label>
+        <label class="check"><input type="checkbox" data-key="tts.skipLinks"> Don't read links</label>
+        <div class="inline-checks">Read messages from:
+          <label class="check"><input type="checkbox" data-key="tts.platforms.twitch"> Twitch</label>
+          <label class="check"><input type="checkbox" data-key="tts.platforms.youtube"> YouTube</label>
+          <label class="check"><input type="checkbox" data-key="tts.platforms.kick"> Kick</label>
+        </div>
+        <label>Ignored users <small>(one per line, e.g. bots)</small><textarea rows="3" data-key="tts.ignoredUsers" data-type="list"></textarea></label>
+      </div>
+      <div class="card">
+        <h4>Playback</h4>
+        <label>Volume <output data-out="tts.volume"></output><input type="range" min="0" max="1" step="0.05" data-key="tts.volume"></label>
+        <label>Speed <output data-out="tts.rate"></output><input type="range" min="0.5" max="2" step="0.05" data-key="tts.rate"></label>
+        <label>Max queued messages<input type="number" min="1" max="100" data-key="tts.maxQueue"></label>
+        <label>Cloud TTS voice <small>(API key only, e.g. ar-XA-Wavenet-B)</small><input type="text" data-key="google.cloudVoice" spellcheck="false"></label>
+      </div>
+    </section>
+
+    <!-- ================= ADVANCED ================= -->
+    <section data-panel="advanced" class="panel">
+      <div class="card">
+        <h4>Tools</h4>
+        <div class="btn-row wrap">
+          <button id="send-test">Send test messages</button>
+          <button id="clear-chat">Clear chat</button>
+          <button data-reconnect="">Reconnect all</button>
+        </div>
+      </div>
+      <div class="card">
+        <h4>Server</h4>
+        <label>HTTP port <small>(restart the app after changing)</small><input type="number" min="1024" max="65535" data-key="server.port"></label>
+        <p class="hint">Overlay for a Browser Source: <code id="overlay-url"></code></p>
+        <p class="hint">Settings file: <code id="config-path"></code></p>
+        <button id="reset-settings" class="danger">Reset settings to defaults</button>
+      </div>
+      <p class="hint" id="version"></p>
+    </section>
+  </div>
+</aside>
+
+<script src="/app.js"></script>
+</body>
+</html>
