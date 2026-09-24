@@ -36,19 +36,34 @@ A lightweight C++ app that merges **YouTube**, **Twitch** and **Kick** live chat
 
 ## Building
 
-Requirements: CMake ≥ 3.20, a C++17 compiler, and OpenSSL 3. Everything else (cpp-httplib, IXWebSocket, nlohmann/json) is downloaded by CMake.
+### Windows: Visual Studio 2022 (no setup)
+1. Install **Visual Studio 2022** with the **"Desktop development with C++"** workload. That workload includes CMake, Ninja and Git.
+2. **File → Open → Folder…** and pick this repository.
+3. Choose the **Windows x64 Release** configuration and pick `UnifiedStreamChat.exe` as the startup item.
+4. **Build → Build All**, then run it.
 
-```bash
-# Linux:   sudo apt install build-essential cmake libssl-dev
-# macOS:   brew install cmake openssl@3   (then add -DOPENSSL_ROOT_DIR=$(brew --prefix openssl@3))
-# Windows: install Visual Studio 2022 + CMake + OpenSSL (e.g. `choco install openssl`)
+No OpenSSL, no vcpkg and no paths to configure. On Windows, HTTPS and WebSockets use **WinHTTP**, which is built into Windows: TLS comes from SChannel, certificates from the Windows certificate store, and the proxy from your system settings. The dependencies are header-only (nlohmann/json, cpp-httplib) and CMake downloads them automatically. The C++ runtime is linked statically, so `UnifiedStreamChat.exe` is a single file that runs on any Windows 10 or 11 PC.
 
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build --config Release
-ctest --test-dir build -C Release     # unit tests
+From a *Developer Command Prompt* the same build is:
+```bat
+cmake --preset x64-release
+cmake --build --preset x64-release
 ```
 
-Every push to GitHub runs `.github/workflows/build.yml`, which builds downloadable Windows, macOS and Linux binaries. On Windows the OpenSSL DLLs are included.
+**Optional: vcpkg.** The root `vcpkg.json` is a manifest with a pinned `builtin-baseline`. If you prefer vcpkg packages, use the **Windows x64 Release (vcpkg manifest)** preset, which uses `%VCPKG_ROOT%` (VS 2022's Developer environment sets it). CMake then uses vcpkg's `nlohmann-json` and falls back to FetchContent for anything that's missing. On Windows, vcpkg only installs that one header-only package.
+
+### Linux / macOS
+Requirements: CMake ≥ 3.21, a C++17 compiler and OpenSSL 3. IXWebSocket is downloaded automatically, or taken from vcpkg.
+
+```bash
+# Linux:   sudo apt install build-essential cmake git libssl-dev
+# macOS:   brew install cmake openssl@3   (add -DOPENSSL_ROOT_DIR=$(brew --prefix openssl@3) if needed)
+cmake --preset linux-release
+cmake --build --preset linux-release
+ctest --preset linux-release
+```
+
+Every push to GitHub runs `.github/workflows/build.yml`, which builds downloadable Windows, macOS and Linux binaries.
 
 ## Running and adding it to OBS
 
@@ -105,11 +120,14 @@ The dock plays the speech in order through `/api/tts`, and the backend fetches t
 ## Project layout
 
 ```
-CMakeLists.txt            build, FetchContent deps, embeds web/ into the binary
+CMakeLists.txt            build; deps from vcpkg if present, else FetchContent; embeds web/
+CMakePresets.json         Visual Studio / command-line configurations
+vcpkg.json                optional vcpkg manifest (pinned baseline)
 cmake/EmbedAssets.cmake   web/* -> generated C++ byte arrays
 src/main.cpp              CLI entry point
 src/core/                 App (wiring), Settings, TokenStore, MessagePipeline, EventHub (SSE), Util
-src/net/                  HTTPS client helpers, OAuth2 authorization-code flow
+src/net/                  HTTPS client + WebSocket client (WinHTTP on Windows,
+                          cpp-httplib/IXWebSocket + OpenSSL elsewhere), OAuth2 flow
 src/platforms/            TwitchClient, YouTubeClient, KickClient
 src/services/             Translator (Google Translate), TtsService (Google TTS)
 src/server/               WebServer: static UI, REST API, SSE, OAuth callbacks

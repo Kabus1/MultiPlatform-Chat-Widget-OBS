@@ -19,11 +19,7 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libssl-dev
 
-      - name: Install OpenSSL (Windows)
-        if: runner.os == 'Windows'
-        run: |
-          choco install openssl --no-progress -y
-          echo "OPENSSL_ROOT_DIR=C:/Program Files/OpenSSL" >> $env:GITHUB_ENV
+      # Windows needs nothing extra: HTTPS/WebSockets use the built-in WinHTTP.
 
       - name: Install OpenSSL (macOS)
         if: runner.os == 'macOS'
@@ -43,8 +39,7 @@ jobs:
         run: |
           mkdir -p dist
           if [ "$RUNNER_OS" = "Windows" ]; then
-            cp build/Release/UnifiedStreamChat.exe dist/
-            cp "C:/Program Files/OpenSSL/bin/"libssl-3*.dll "C:/Program Files/OpenSSL/bin/"libcrypto-3*.dll dist/
+            cp build/Release/UnifiedStreamChat.exe dist/   # self-contained, no DLLs
           else
             cp build/unified_stream_chat dist/
           fi

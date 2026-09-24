@@ -9,7 +9,7 @@
 #include <mutex>
 #include <thread>
 
-namespace ix { class WebSocket; }
+#include "net/WebSocketClient.hpp"
 
 namespace usc {
 
@@ -36,12 +36,12 @@ public:
 private:
     void run();
     std::string lookupChatroomId(std::string& error);
-    void onText(const std::string& payload, ix::WebSocket& ws);
+    void onText(const std::string& payload, WebSocketClient& ws);
 
     Config cfg_;
     MessageSink onMessage_;
     StatusSink onStatus_;
-    std::unique_ptr<ix::WebSocket> ws_;
+    std::unique_ptr<WebSocketClient> ws_;
     std::string chatroomId_;
     std::thread resolver_;
     std::atomic<bool> running_{false};

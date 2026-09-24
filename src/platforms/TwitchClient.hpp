@@ -7,7 +7,7 @@
 #include <memory>
 #include <mutex>
 
-namespace ix { class WebSocket; }
+#include "net/WebSocketClient.hpp"
 
 namespace usc {
 
@@ -46,7 +46,7 @@ private:
     Config cfg_;
     MessageSink onMessage_;
     StatusSink onStatus_;
-    std::unique_ptr<ix::WebSocket> ws_;
+    std::unique_ptr<WebSocketClient> ws_;
     std::string channel_;
     std::atomic<bool> running_{false};
     std::mutex sendMutex_;

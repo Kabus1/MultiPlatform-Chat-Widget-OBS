@@ -4,8 +4,6 @@
 #include "core/Util.hpp"
 #include "net/Http.hpp"
 
-#include <ixwebsocket/IXWebSocket.h>
-
 #include <chrono>
 #include <regex>
 
@@ -27,7 +25,7 @@ void KickClient::start() {
 void KickClient::stop() {
     if (!running_.exchange(false)) return;
     if (resolver_.joinable()) resolver_.join();
-    std::unique_ptr<ix::WebSocket> ws;
+    std::unique_ptr<WebSocketClient> ws;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         ws = std::move(ws_);
@@ -85,24 +83,18 @@ void KickClient::run() {
     if (!running_) return;
     chatroomId_ = id;
 
-    auto ws = std::make_unique<ix::WebSocket>();
-    ws->setUrl("wss://ws-" + cfg_.pusherCluster + ".pusher.com/app/" + cfg_.pusherKey +
-               "?protocol=7&client=js&version=8.4.0&flash=false");
-    ws->enableAutomaticReconnection();
-    ws->setMaxWaitBetweenReconnectionRetries(30000);
-    ix::WebSocket* socket = ws.get(); // callbacks only run while the socket is alive
-    ws->setOnMessageCallback([this, socket](const ix::WebSocketMessagePtr& msg) {
-        switch (msg->type) {
-        case ix::WebSocketMessageType::Message: onText(msg->str, *socket); break;
-        case ix::WebSocketMessageType::Close:
-            if (running_) onStatus_("connecting", "Disconnected, reconnecting...");
-            break;
-        case ix::WebSocketMessageType::Error:
-            onStatus_("error", "Connection error: " + msg->errorInfo.reason);
-            break;
-        default: break;
-        }
-    });
+    // Callbacks only run while the client is alive (stop() joins its thread).
+    auto socket = std::make_shared<WebSocketClient*>(nullptr);
+    WebSocketClient::Callbacks cb;
+    cb.onMessage = [this, socket](const std::string& text) { onText(text, **socket); };
+    cb.onClose = [this] {
+        if (running_) onStatus_("connecting", "Disconnected, reconnecting...");
+    };
+    cb.onError = [this](const std::string& reason) { onStatus_("error", "Connection error: " + reason); };
+    auto ws = std::make_unique<WebSocketClient>("wss://ws-" + cfg_.pusherCluster + ".pusher.com/app/" + cfg_.pusherKey +
+                                                    "?protocol=7&client=js&version=8.4.0&flash=false",
+                                                std::move(cb));
+    *socket = ws.get();
     onStatus_("connecting", "Connecting to chatroom " + chatroomId_);
     std::lock_guard<std::mutex> lock(mutex_);
     if (!running_) return;
@@ -110,7 +102,7 @@ void KickClient::run() {
     ws_->start();
 }
 
-void KickClient::onText(const std::string& payload, ix::WebSocket& ws) {
+void KickClient::onText(const std::string& payload, WebSocketClient& ws) {
     json j;
     try {
         j = json::parse(payload);

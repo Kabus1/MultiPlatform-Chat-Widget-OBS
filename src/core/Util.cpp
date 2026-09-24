@@ -1,12 +1,11 @@
 #include "core/Util.hpp"
 
-#include <openssl/rand.h>
-
 #include <algorithm>
 #include <cctype>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
+#include <random>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -145,8 +144,11 @@ std::string replaceAll(std::string s, std::string_view from, std::string_view to
 }
 
 std::string randomToken(size_t bytes) {
+    // random_device is backed by the OS CSPRNG (rand_s / BCrypt on Windows,
+    // getrandom or /dev/urandom elsewhere); only used for OAuth state values.
+    std::random_device rd;
     std::vector<unsigned char> buf(bytes);
-    RAND_bytes(buf.data(), static_cast<int>(buf.size()));
+    for (auto& b : buf) b = static_cast<unsigned char>(rd() & 0xFF);
     static const char* hex = "0123456789abcdef";
     std::string out;
     for (unsigned char b : buf) {

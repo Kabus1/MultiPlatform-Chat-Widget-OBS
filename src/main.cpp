@@ -3,8 +3,6 @@
 #include "core/Util.hpp"
 #include "server/WebServer.hpp"
 
-#include <ixwebsocket/IXNetSystem.h>
-
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -62,7 +60,6 @@ int main(int argc, char** argv) {
 
     std::signal(SIGINT, onSignal);
     std::signal(SIGTERM, onSignal);
-    ix::initNetSystem();
 
     usc::App app(configDir, port);
     usc::WebServer server(app, webDir);
@@ -82,6 +79,5 @@ int main(int argc, char** argv) {
     LOG_INFO("app", "shutting down");
     app.shutdown(); // closes SSE streams so the server can stop promptly
     server.stop();
-    ix::uninitNetSystem();
     return 0;
 }

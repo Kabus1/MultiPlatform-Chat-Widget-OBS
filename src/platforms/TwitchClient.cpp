@@ -3,8 +3,6 @@
 #include "core/Log.hpp"
 #include "core/Util.hpp"
 
-#include <ixwebsocket/IXWebSocket.h>
-
 #include <algorithm>
 #include <sstream>
 
@@ -59,25 +57,14 @@ void TwitchClient::start() {
         return;
     }
 
-    ws_ = std::make_unique<ix::WebSocket>();
-    ws_->setUrl("wss://irc-ws.chat.twitch.tv:443");
-    ws_->setPingInterval(60);
-    ws_->enableAutomaticReconnection();
-    ws_->setMinWaitBetweenReconnectionRetries(1000);
-    ws_->setMaxWaitBetweenReconnectionRetries(30000);
-    ws_->setOnMessageCallback([this](const ix::WebSocketMessagePtr& msg) {
-        switch (msg->type) {
-        case ix::WebSocketMessageType::Open: onOpen(); break;
-        case ix::WebSocketMessageType::Message: onText(msg->str); break;
-        case ix::WebSocketMessageType::Close:
-            if (running_) onStatus_("connecting", "Disconnected, reconnecting...");
-            break;
-        case ix::WebSocketMessageType::Error:
-            onStatus_("error", "Connection error: " + msg->errorInfo.reason);
-            break;
-        default: break;
-        }
-    });
+    WebSocketClient::Callbacks cb;
+    cb.onOpen = [this] { onOpen(); };
+    cb.onMessage = [this](const std::string& text) { onText(text); };
+    cb.onClose = [this] {
+        if (running_) onStatus_("connecting", "Disconnected, reconnecting...");
+    };
+    cb.onError = [this](const std::string& reason) { onStatus_("error", "Connection error: " + reason); };
+    ws_ = std::make_unique<WebSocketClient>("wss://irc-ws.chat.twitch.tv:443", std::move(cb));
     onStatus_("connecting", "Connecting to #" + channel_);
     ws_->start();
 }
@@ -225,7 +212,7 @@ void TwitchClient::handleLine(const std::string& raw) {
         onStatus_("connected", "#" + channel_);
     } else if (l.command == "RECONNECT") {
         LOG_INFO("twitch", "server requested reconnect");
-        if (ws_) ws_->close();
+        if (ws_) ws_->reconnect();
     } else if (l.command == "NOTICE") {
         std::string text = l.params.empty() ? "" : l.params.back();
         if (text.find("authentication failed") != std::string::npos ||
@@ -233,7 +220,7 @@ void TwitchClient::handleLine(const std::string& raw) {
             LOG_WARN("twitch", "auth failed, refreshing token");
             onStatus_("error", "Authentication failed - refreshing token");
             if (!cfg_.tokens(true)) onStatus_("error", "Session expired - please log in with Twitch again");
-            if (ws_) ws_->close(); // automatic reconnection re-sends PASS with the new token
+            if (ws_) ws_->reconnect(); // reconnection re-sends PASS with the new token
         }
     } else if (l.command == "CLEARCHAT" || l.command == "CLEARMSG") {
         // Moderation events could be forwarded to hide messages; not needed yet.

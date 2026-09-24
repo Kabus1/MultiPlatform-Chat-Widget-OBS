@@ -1,0 +1,20 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "unified-stream-chat",
+  "version": "0.2.0",
+  "description": "Unified YouTube / Twitch / Kick chat dock for OBS with Google Translate and TTS.",
+  "homepage": "https://github.com/kabus1/MultiPlatform-Chat-Widget-OBS",
+  "license": "MIT",
+  "builtin-baseline": "9e593bb18ea69cc5095e012465dcd675a822ed0d",
+  "dependencies": [
+    "nlohmann-json",
+    {
+      "name": "openssl",
+      "platform": "!windows"
+    },
+    {
+      "name": "ixwebsocket",
+      "platform": "!windows"
+    }
+  ]
+}
