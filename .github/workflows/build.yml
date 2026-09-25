@@ -17,7 +17,7 @@ jobs:
 
       - name: Install OpenSSL (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev libwebkit2gtk-4.1-dev
 
       # Windows needs nothing extra: HTTPS/WebSockets use the built-in WinHTTP.
 

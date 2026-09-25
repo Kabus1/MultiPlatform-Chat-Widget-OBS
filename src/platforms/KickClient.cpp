@@ -144,6 +144,7 @@ std::optional<ChatMessage> KickClient::parseChatEvent(const json& data) {
         std::string t = b.value("type", "");
         if (t == "broadcaster" || t == "moderator" || t == "vip" || t == "verified") m.roles.push_back(t);
         else if (t == "subscriber" || t == "founder" || t == "og") m.roles.push_back("subscriber");
+        else if (t == "bot") m.roles.push_back("bot");
     }
     m.timestamp = util::nowMs();
 

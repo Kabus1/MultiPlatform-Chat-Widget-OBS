@@ -62,7 +62,37 @@ json Settings::defaults() {
             {"rate", 1.0},
             {"maxQueue", 10},
             {"platforms", {{"twitch", true}, {"youtube", true}, {"kick", true}}},
-            {"ignoredUsers", json::array({"nightbot", "streamelements", "streamlabs", "moobot", "botrixoficial"})},
+            {"ignoredUsers", json::array()}, // real users who should not be read aloud
+        }},
+        {"audio", {
+            // "app": the program plays TTS itself on the chosen output device
+            //        (works with the window closed and never doubles up).
+            // "browser": the dock / window page plays it (old behaviour).
+            {"output", "app"},
+            {"deviceName", ""},   // empty = system default output device
+            {"channel", "both"},  // "both" | "left" | "right"
+            {"muted", false},
+        }},
+        {"bots", {
+            // Messages from bots are dropped completely: not shown, not read.
+            {"enabled", true},
+            {"knownBots", json::array({
+                "nightbot", "streamelements", "streamlabs", "moobot", "fossabot", "wizebot",
+                "botrix", "botrixoficial", "kickbot", "sery_bot", "soundalerts", "commanderroot",
+                "streamholics", "pretzelrocks", "own3d", "deepbot", "phantombot", "coebot",
+                "ankhbot", "streamlootsbot", "lolrankbot", "creatisbot", "kofistreambot",
+                "tangiabot", "blerp", "songlistbot", "restreambot", "mixitupbot", "botisimo",
+                "kicklet", "kickbotapp", "throneappbot"})},
+            {"customBots", json::array()},     // user-added names
+            {"allowedUsers", json::array()},   // never treated as bots
+            {"nameSuffixRule", true},          // names ending in "bot" / "_bot" count as bots
+            {"useBadges", true},               // platform "bot" badges
+            {"hideCommands", false},           // also hide "!command" messages from viewers
+        }},
+        {"window", {
+            {"width", 440},
+            {"height", 780},
+            {"alwaysOnTop", false},
         }},
         {"ui", {
             {"theme", "dark"},

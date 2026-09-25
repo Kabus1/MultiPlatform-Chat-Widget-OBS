@@ -21,7 +21,9 @@ App::App(const std::string& configDir, int portOverride)
     : settings_((std::filesystem::path(configDir) / "settings.json").string()),
       tokens_((std::filesystem::path(configDir) / "tokens.json").string()),
       hub_(100),
-      pipeline_(settings_, hub_, translator_) {
+      pipeline_(settings_, hub_, translator_),
+      audio_(settings_, tts_) {
+    pipeline_.setSpeechSink([this](const json& segments) { audio_.enqueue(segments); });
     settings_.load();
     tokens_.load();
     port_ = portOverride > 0 ? portOverride : settings_.snapshot()["server"].value("port", 8787);
@@ -32,6 +34,7 @@ App::App(const std::string& configDir, int portOverride)
 App::~App() { shutdown(); }
 
 void App::start() {
+    audio_.start();
     pipeline_.start();
     for (const char* p : kPlatforms) restartPlatform(p);
 }
@@ -44,6 +47,7 @@ void App::shutdown() {
     }
     for (auto& [name, c] : clients) c->stop();
     pipeline_.stop();
+    audio_.stop();
     hub_.closeAll();
 }
 
@@ -192,11 +196,21 @@ json App::status() {
         platforms[p]["account"] = t ? t->login : "";
         platforms[p]["redirectUri"] = redirectUri(p);
     }
-    return {{"version", APP_VERSION}, {"port", port_}, {"platforms", platforms}, {"configPath", settings_.path()}};
+    return {{"version", APP_VERSION},
+            {"port", port_},
+            {"platforms", platforms},
+            {"configPath", settings_.path()},
+            {"botsFiltered", pipeline_.botsFiltered()},
+            {"links", links()}};
 }
 
 json App::applySettings(const json& patch) {
+    json before = settings_.snapshot()["audio"];
     json s = settings_.applyPatch(patch);
+    // Muting or moving TTS to the browser silences anything queued natively.
+    if ((s["audio"].value("muted", false) && !before.value("muted", false)) ||
+        s["audio"].value("output", "") != before.value("output", ""))
+        audio_.clear();
     // Only reconnect the platforms whose connection settings actually changed.
     for (const char* p : kPlatforms) {
         bool changed;
@@ -274,6 +288,32 @@ void App::injectTestMessages() {
                           {{T::Text, "What settings are you using for this game? ", ""},
                            {T::Emote, "KEKW", "https://files.kick.com/emotes/37226/fullsize"}},
                           {"moderator"}));
+    // Should never appear: removed by the bot filter (when enabled).
+    pipeline_.submit(make("twitch", "Nightbot", "#7C7CE1",
+                          {{T::Text, "Follow the channel! Type !discord for the server link.", ""}}, {"moderator"}));
+}
+
+json App::links() const {
+    std::string base = "http://localhost:" + std::to_string(port_);
+    return {
+        {"dock", base + "/"},
+        {"overlay", base + "/overlay"},
+        {"overlayVoice", base + "/overlay?tts=1"},
+        {"window", base + "/?app=1"},
+    };
+}
+
+void App::testVoice() {
+    json s = settings_.snapshot();
+    std::string lang = s["translation"].value("targetLang", std::string("ar"));
+    std::string text = lang == "ar" ? "مرحبا! هذا اختبار لصوت القراءة." : "Hello! This is a text to speech test.";
+    json segments = json::array({{{"text", text}, {"lang", lang}}});
+    if (s["audio"].value("output", std::string("app")) == "app") {
+        audio_.clear();
+        audio_.enqueue(segments);
+    } else {
+        hub_.publish("speak", segments); // pages in browser mode play it
+    }
 }
 
 void App::clearChat() {

@@ -1,6 +1,8 @@
 #include "core/MessagePipeline.hpp"
 
+#include "core/BotFilter.hpp"
 #include "core/EventHub.hpp"
+#include "core/Log.hpp"
 #include "core/Settings.hpp"
 #include "core/Util.hpp"
 #include "services/Translator.hpp"
@@ -83,7 +85,18 @@ void MessagePipeline::run() {
             queue_.pop_front();
             backlog = queue_.size();
         }
+        json s = settings_.snapshot();
+        std::string why = BotFilter::reason(m, s["bots"]);
+        if (!why.empty()) {
+            ++botsFiltered_;
+            LOG_INFO("bots", "dropped ", m.platform, " message from ", m.displayName, " (", why, ")");
+            continue; // never shown, translated or spoken
+        }
         process(m, backlog);
+        const json& audio = s["audio"];
+        m.ttsTarget = audio.value("output", std::string("app"));
+        if (!m.tts.is_null() && m.ttsTarget == "app" && !audio.value("muted", false) && speechSink_)
+            speechSink_(m.tts);
         hub_.publish("chat", m.toJson(), true);
     }
 }

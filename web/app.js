@@ -7,7 +7,12 @@
   const params = new URLSearchParams(location.search);
   const isOverlay = location.pathname.startsWith('/overlay') || params.get('overlay') === '1';
   // The dock speaks by default; an overlay only when ?tts=1 (avoids double audio).
-  const speakHere = params.has('tts') ? params.get('tts') === '1' : !isOverlay;
+  const isApp = params.get('app') === '1'; // inside the native desktop window
+  // ?tts=1 forces this page to speak (e.g. OBS Browser Source with voice).
+  const forceSpeak = params.get('tts') === '1';
+  const neverSpeak = params.get('tts') === '0' || (isOverlay && !forceSpeak);
+  // Should this page play TTS audio itself? (Otherwise the app plays it natively.)
+  const pageSpeaks = () => forceSpeak || (!neverSpeak && settings && settings.audio.output === 'browser');
 
   const LOGOS = {
     twitch: '<svg viewBox="0 0 24 24" aria-label="Twitch"><path fill="currentColor" d="M11.571 4.714h1.715v5.143H11.57zm4.715 0H18v5.143h-1.714zM6 0 1.714 4.286v15.428h5.143V24l4.286-4.286h3.428L22.286 12V0zm14.571 11.143-3.428 3.428h-3.429l-3 3v-3H6.857V1.714h13.714Z"/></svg>',
@@ -157,7 +162,7 @@
     trimChat();
     if (stickToBottom || isOverlay) chatEl.scrollTop = chatEl.scrollHeight;
 
-    if (m.tts && speakHere) tts.enqueue(m.tts);
+    if (m.tts && pageSpeaks() && (forceSpeak || m.ttsTarget === 'browser')) tts.enqueue(m.tts);
   }
 
   function trimChat() {
@@ -184,20 +189,23 @@
     let playing = false;
     let skipRequested = false;
     let finishCurrent = null; // resolves the segment that is playing now
-    let muted = false;
-    try { muted = localStorage.getItem('usc.muted') === '1'; } catch (_) { /* storage unavailable */ }
+    // Mute is stored in settings.audio.muted (config file) and shared by the
+    // native player, the dock and the window.
+    const isMuted = () => !!(settings && settings.audio.muted);
 
     function updateButton() {
       const b = $('#tts-toggle');
+      const muted = isMuted();
       b.textContent = muted ? '🔇' : '🔊';
       b.classList.toggle('muted', muted);
       b.setAttribute('aria-pressed', String(muted));
-      b.hidden = !speakHere;
-      $('#tts-skip').hidden = !speakHere;
+      const show = !isOverlay && settings && settings.tts.enabled;
+      b.hidden = !show;
+      $('#tts-skip').hidden = !show;
     }
 
     function enqueue(segments) {
-      if (muted || !Array.isArray(segments) || !segments.length) return;
+      if (isMuted() || !Array.isArray(segments) || !segments.length) return;
       const max = Math.max(1, settings.tts.maxQueue | 0);
       while (queue.length >= max) queue.shift(); // stay close to live chat
       queue.push(segments);
@@ -234,7 +242,7 @@
         const segments = queue.shift();
         skipRequested = false;
         for (const seg of segments) {
-          if (muted || skipRequested) break;
+          if (isMuted() || skipRequested) break;
           await playSegment(seg);
         }
       }
@@ -246,18 +254,24 @@
       if (finishCurrent) finishCurrent();
     }
 
-    function setMuted(v) {
-      muted = v;
-      try { localStorage.setItem('usc.muted', v ? '1' : '0'); } catch (_) { /* ignore */ }
-      if (v) { queue.length = 0; skip(); }
-      updateButton();
+    function stopLocal() {
+      queue.length = 0;
+      skip();
     }
 
-    return { enqueue, skip, setMuted, isMuted: () => muted, updateButton };
+    return { enqueue, skip, stopLocal, isMuted, updateButton };
   })();
 
-  $('#tts-toggle').addEventListener('click', () => tts.setMuted(!tts.isMuted()));
-  $('#tts-skip').addEventListener('click', () => tts.skip());
+  $('#tts-toggle').addEventListener('click', async () => {
+    const muted = !tts.isMuted();
+    if (muted) tts.stopLocal();
+    settings = await api('/api/settings', { method: 'POST', body: { audio: { muted } } });
+    tts.updateButton();
+  });
+  $('#tts-skip').addEventListener('click', () => {
+    tts.skip();
+    api('/api/audio/skip', { method: 'POST' }).catch(() => {});
+  });
   $('#audio-unlock').addEventListener('click', () => {
     $('#audio-unlock').hidden = true;
     new Audio().play().catch(() => {});
@@ -291,7 +305,9 @@
       if (redirect && st.redirectUri) redirect.textContent = st.redirectUri;
     }
     $('#config-path').textContent = status.configPath || '';
-    $('#overlay-url').textContent = `${location.origin}/overlay`;
+    const links = status.links || {};
+    $$('[data-link]').forEach((c) => { c.textContent = links[c.dataset.link] || ''; });
+    $('#bots-count').textContent = status.botsFiltered ? `${status.botsFiltered} bot message(s) filtered this session.` : '';
     $('#version').textContent = status.version ? `Unified Stream Chat v${status.version}` : '';
   }
 
@@ -414,14 +430,82 @@
     fillForm();
     applyAppearance();
   });
-  $('#tts-test').addEventListener('click', () => {
-    const lang = settings.translation.targetLang;
-    const sample = lang === 'ar' ? 'مرحبا! هذا اختبار لصوت القراءة.' : 'Hello! This is a text to speech test.';
-    const segs = [];
-    if (settings.tts.readUsername) segs.push({ text: settings.tts.usernameTemplate.replace('{user}', 'Tester'), lang });
-    segs.push({ text: sample, lang });
-    tts.enqueue(segs);
+  $('#tts-test').addEventListener('click', async () => {
+    await flushSave();
+    api('/api/audio/test', { method: 'POST' }); // plays on the configured output
   });
+
+  // ------------------------------------------------------------------ audio devices
+  async function loadDevices() {
+    const sel = $('#audio-device');
+    let info;
+    try {
+      info = await api('/api/audio/devices');
+    } catch (e) {
+      $('#audio-status').textContent = 'Cannot list audio devices: ' + e.message;
+      return;
+    }
+    const saved = settings.audio.deviceName;
+    sel.textContent = '';
+    sel.append(new Option('System default output', ''));
+    for (const d of info.devices || []) sel.append(new Option(d.name + (d.isDefault ? '  (default)' : ''), d.name));
+    if (saved && !(info.devices || []).some((d) => d.name === saved)) {
+      // Keep the saved choice visible even while it is unplugged.
+      sel.append(new Option(saved + '  (not connected)', saved));
+    }
+    sel.value = saved;
+    const st = $('#audio-status');
+    st.classList.toggle('warn-text', !!info.missing || !!info.error);
+    if (info.error) st.textContent = info.error;
+    else if (info.missing) st.textContent = `"${saved}" is not connected right now, the system default is used until it is back.`;
+    else st.textContent = `${(info.devices || []).length} output device(s) found` + (info.backend ? ` via ${info.backend}.` : '.');
+  }
+  $('#audio-refresh').addEventListener('click', loadDevices);
+  $('#audio-device').addEventListener('change', async (e) => {
+    settings = await api('/api/settings', { method: 'POST', body: { audio: { deviceName: e.target.value } } });
+    loadDevices();
+  });
+  function updateAudioUi() {
+    $('.app-audio').style.display = settings.audio.output === 'app' ? '' : 'none';
+    const sel = $('#audio-device');
+    if ([...sel.options].some((o) => o.value === settings.audio.deviceName)) sel.value = settings.audio.deviceName;
+  }
+
+  // ------------------------------------------------------------------ links
+  $$('[data-copy-link]').forEach((b) => b.addEventListener('click', () => {
+    const text = $(`[data-link="${b.dataset.copyLink}"]`).textContent;
+    const done = () => { b.textContent = 'Copied'; setTimeout(() => { b.textContent = 'Copy'; }, 1200); };
+    if (navigator.clipboard) navigator.clipboard.writeText(text).then(done, () => fallbackCopy(text, done));
+    else fallbackCopy(text, done);
+  }));
+  function fallbackCopy(text, done) {
+    const ta = el('textarea');
+    ta.value = text;
+    document.body.append(ta);
+    ta.select();
+    try { document.execCommand('copy'); done(); } catch (_) { /* ignore */ }
+    ta.remove();
+  }
+  $$('[data-open-link]').forEach((b) => b.addEventListener('click', () =>
+    api('/api/open?target=' + encodeURIComponent(b.dataset.openLink), { method: 'POST' })));
+  $('#links-btn').addEventListener('click', () => {
+    openSettings(true);
+    $('.tabs button[data-tab="links"]').click();
+  });
+
+  // ------------------------------------------------------------------ app window integration
+  function applyWindowSettings() {
+    if (isApp && typeof window.uscSetOnTop === 'function') window.uscSetOnTop(!!settings.window.alwaysOnTop);
+  }
+  if (isApp) {
+    let resizeTimer = null;
+    window.addEventListener('resize', () => {
+      clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(() => {
+        if (typeof window.uscSaveSize === 'function') window.uscSaveSize(window.innerWidth, window.innerHeight);
+      }, 800);
+    });
+  }
 
   // ------------------------------------------------------------------ live events
   function connectEvents() {
@@ -443,6 +527,12 @@
       settings = JSON.parse(e.data);
       fillForm();
       applyAppearance();
+      tts.updateButton();
+      updateAudioUi();
+      applyWindowSettings();
+    });
+    es.addEventListener('speak', (e) => {
+      if (pageSpeaks()) tts.enqueue(JSON.parse(e.data));
     });
     es.addEventListener('clear', () => {
       chatEl.textContent = '';
@@ -458,6 +548,7 @@
   // ------------------------------------------------------------------ boot
   async function boot() {
     if (isOverlay) document.body.classList.add('overlay');
+    if (isApp) document.body.classList.add('app');
     try {
       settings = await api('/api/settings');
     } catch (e) {
@@ -468,6 +559,9 @@
     fillForm();
     applyAppearance();
     tts.updateButton();
+    updateAudioUi();
+    applyWindowSettings();
+    loadDevices();
     showEmptyHint();
     connectEvents();
   }

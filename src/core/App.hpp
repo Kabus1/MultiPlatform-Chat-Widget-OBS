@@ -6,6 +6,7 @@
 #include "core/TokenStore.hpp"
 #include "net/OAuth.hpp"
 #include "platforms/PlatformClient.hpp"
+#include "services/AudioPlayer.hpp"
 #include "services/Translator.hpp"
 #include "services/TtsService.hpp"
 
@@ -32,6 +33,12 @@ public:
     Settings& settings() { return settings_; }
     EventHub& hub() { return hub_; }
     TtsService& tts() { return tts_; }
+    AudioPlayer& audio() { return audio_; }
+
+    // Speaks a short sample on the configured output (app or browser).
+    void testVoice();
+    // Links the dock / overlay can be embedded with.
+    nlohmann::json links() const;
 
     nlohmann::json status();
     nlohmann::json applySettings(const nlohmann::json& patch);
@@ -59,6 +66,7 @@ private:
     Translator translator_;
     TtsService tts_;
     MessagePipeline pipeline_;
+    AudioPlayer audio_;
     int port_;
 
     std::mutex clientsMutex_;

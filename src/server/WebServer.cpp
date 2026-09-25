@@ -145,6 +145,8 @@ void WebServer::routes() {
         d["kick"]["username"] = cur["kick"]["username"];
         d["kick"]["enabled"] = cur["kick"]["enabled"];
         d["google"] = cur["google"];
+        d["audio"] = cur["audio"]; // keep the chosen speaker across resets
+        d["window"] = cur["window"];
         d["server"] = cur["server"];
         sendJson(res, app_.applySettings(d));
     });
@@ -214,6 +216,35 @@ void WebServer::routes() {
         std::string error = app_.finishLogin(platform, req.get_param_value("code"), req.get_param_value("state"));
         res.set_content(authPage(error.empty(), error.empty() ? "Your " + platform + " account is linked." : error),
                         "text/html; charset=utf-8");
+    });
+
+    // --- native audio output ---------------------------------------------
+    s.Get("/api/audio/devices", [this](const httplib::Request&, httplib::Response& res) {
+        sendJson(res, app_.audio().devices());
+    });
+    s.Post("/api/audio/test", [this](const httplib::Request&, httplib::Response& res) {
+        app_.testVoice();
+        sendJson(res, {{"ok", true}});
+    });
+    s.Post("/api/audio/skip", [this](const httplib::Request&, httplib::Response& res) {
+        app_.audio().skip();
+        sendJson(res, {{"ok", true}});
+    });
+    s.Post("/api/audio/clear", [this](const httplib::Request&, httplib::Response& res) {
+        app_.audio().clear();
+        sendJson(res, {{"ok", true}});
+    });
+
+    // --- links -----------------------------------------------------------
+    s.Get("/api/links", [this](const httplib::Request&, httplib::Response& res) { sendJson(res, app_.links()); });
+    // Opens one of our own links in the system browser (only known targets,
+    // never an arbitrary URL).
+    s.Post("/api/open", [this](const httplib::Request& req, httplib::Response& res) {
+        json links = app_.links();
+        std::string target = req.get_param_value("target");
+        if (!links.contains(target)) return sendJson(res, {{"error", "unknown link"}}, 400);
+        util::openInSystemBrowser(links[target].get<std::string>());
+        sendJson(res, {{"ok", true}});
     });
 
     s.Post("/api/reconnect", [this](const httplib::Request& req, httplib::Response& res) {

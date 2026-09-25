@@ -11,6 +11,7 @@
   <div class="brand">Unified Chat</div>
   <div id="platform-status" aria-label="Connection status"></div>
   <div class="spacer"></div>
+  <button id="links-btn" class="icon-btn" title="Links for OBS / browsers">&#x1F517;</button>
   <button id="tts-toggle" class="icon-btn" title="Mute / unmute text-to-speech" aria-pressed="false"></button>
   <button id="tts-skip" class="icon-btn" title="Skip current message">&#x23ED;</button>
   <button id="settings-btn" class="icon-btn" title="Settings" aria-controls="settings">&#9881;</button>
@@ -32,6 +33,7 @@
     <button role="tab" data-tab="chat">Chat</button>
     <button role="tab" data-tab="translation">Translation</button>
     <button role="tab" data-tab="tts">Voice (TTS)</button>
+    <button role="tab" data-tab="links">Links</button>
     <button role="tab" data-tab="advanced">Advanced</button>
   </nav>
 
@@ -120,6 +122,20 @@
           <label><span class="logo" data-logo="kick"></span>Kick<input type="color" data-key="ui.colors.kick"></label>
         </div>
       </div>
+      <div class="card">
+        <div class="card-head"><h4>Bot filter</h4>
+          <label class="switch"><input type="checkbox" data-key="bots.enabled"><span></span></label></div>
+        <p class="hint">Messages from bots are removed completely: never shown, translated or read aloud. <span id="bots-count"></span></p>
+        <label class="check"><input type="checkbox" data-key="bots.nameSuffixRule"> Treat names ending in "bot" as bots</label>
+        <label class="check"><input type="checkbox" data-key="bots.useBadges"> Use platform bot badges</label>
+        <label class="check"><input type="checkbox" data-key="bots.hideCommands"> Also hide viewers' !commands</label>
+        <label>My extra bots <small>(one per line)</small><textarea rows="2" data-key="bots.customBots" data-type="list" placeholder="mychannelbot"></textarea></label>
+        <label>Never filter these users <small>(one per line)</small><textarea rows="2" data-key="bots.allowedUsers" data-type="list" placeholder="abbott"></textarea></label>
+        <details>
+          <summary>Built-in bot list</summary>
+          <label>Known bots<textarea rows="5" data-key="bots.knownBots" data-type="list"></textarea></label>
+        </details>
+      </div>
     </section>
 
     <!-- ================= TRANSLATION ================= -->
@@ -151,6 +167,24 @@
           <option value="original">Read as-is (original language)</option>
           <option value="translated">Read the translated text</option>
         </select></label>
+      </div>
+      <div class="card">
+        <h4>Audio output</h4>
+        <label>Play the voice through<select data-key="audio.output">
+          <option value="app">This app, on the speaker chosen below (recommended)</option>
+          <option value="browser">The dock / window page (browser audio)</option>
+        </select></label>
+        <div class="app-audio">
+          <label>Output device
+            <span class="select-row"><select id="audio-device"></select><button id="audio-refresh" title="Refresh device list">&#x21bb;</button></span>
+          </label>
+          <label>Channel<select data-key="audio.channel">
+            <option value="both">Both speakers (stereo)</option>
+            <option value="left">Left channel only</option>
+            <option value="right">Right channel only</option>
+          </select></label>
+          <p class="hint" id="audio-status"></p>
+        </div>
         <button id="tts-test">&#9654; Test voice</button>
       </div>
       <div class="card">
@@ -163,7 +197,7 @@
           <label class="check"><input type="checkbox" data-key="tts.platforms.youtube"> YouTube</label>
           <label class="check"><input type="checkbox" data-key="tts.platforms.kick"> Kick</label>
         </div>
-        <label>Ignored users <small>(one per line, e.g. bots)</small><textarea rows="3" data-key="tts.ignoredUsers" data-type="list"></textarea></label>
+        <label>Don't read these users <small>(one per line; bots are removed by the bot filter)</small><textarea rows="3" data-key="tts.ignoredUsers" data-type="list"></textarea></label>
       </div>
       <div class="card">
         <h4>Playback</h4>
@@ -171,6 +205,27 @@
         <label>Speed <output data-out="tts.rate"></output><input type="range" min="0.5" max="2" step="0.05" data-key="tts.rate"></label>
         <label>Max queued messages<input type="number" min="1" max="100" data-key="tts.maxQueue"></label>
         <label>Cloud TTS voice <small>(API key only, e.g. ar-XA-Wavenet-B)</small><input type="text" data-key="google.cloudVoice" spellcheck="false"></label>
+      </div>
+    </section>
+
+    <!-- ================= LINKS ================= -->
+    <section data-panel="links" class="panel">
+      <div class="card">
+        <h4>Links for OBS and browsers</h4>
+        <p class="hint">These work while the app is running, including when you use the app window.</p>
+        <div class="link-item">
+          <div class="link-title">OBS Custom Browser Dock <small>(Docks &rarr; Custom Browser Docks)</small></div>
+          <div class="copy-row"><code data-link="dock"></code><button data-copy-link="dock">Copy</button><button data-open-link="dock">Open</button></div>
+        </div>
+        <div class="link-item">
+          <div class="link-title">Browser Source overlay <small>(transparent, silent)</small></div>
+          <div class="copy-row"><code data-link="overlay"></code><button data-copy-link="overlay">Copy</button><button data-open-link="overlay">Open</button></div>
+        </div>
+        <div class="link-item">
+          <div class="link-title">Browser Source overlay with voice <small>(plays TTS inside OBS)</small></div>
+          <div class="copy-row"><code data-link="overlayVoice"></code><button data-copy-link="overlayVoice">Copy</button><button data-open-link="overlayVoice">Open</button></div>
+        </div>
+        <p class="hint">Tip: with the overlay-with-voice link, set <b>Voice → Audio output</b> to "The dock / window page" or mute the app, so the voice isn't played twice.</p>
       </div>
     </section>
 
@@ -184,10 +239,13 @@
           <button data-reconnect="">Reconnect all</button>
         </div>
       </div>
+      <div class="card app-only">
+        <h4>App window</h4>
+        <label class="check"><input type="checkbox" data-key="window.alwaysOnTop"> Keep the window on top of other windows</label>
+      </div>
       <div class="card">
         <h4>Server</h4>
         <label>HTTP port <small>(restart the app after changing)</small><input type="number" min="1024" max="65535" data-key="server.port"></label>
-        <p class="hint">Overlay for a Browser Source: <code id="overlay-url"></code></p>
         <p class="hint">Settings file: <code id="config-path"></code></p>
         <button id="reset-settings" class="danger">Reset settings to defaults</button>
       </div>

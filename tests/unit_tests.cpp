@@ -1,4 +1,5 @@
 // Minimal self-contained unit tests (no network): run with `ctest` or directly.
+#include "core/BotFilter.hpp"
 #include "core/MessagePipeline.hpp"
 #include "core/Settings.hpp"
 #include "core/Util.hpp"
@@ -140,6 +141,40 @@ void testPipelineDecisions() {
     CHECK(MessagePipeline::stripLinks("look https://x.com/a here") == "look  here");
 }
 
+void testBotFilter() {
+    json bots = Settings::defaults()["bots"];
+    auto from = [](const std::string& user, const std::string& text = "hi") {
+        ChatMessage m;
+        m.platform = "kick";
+        m.username = m.displayName = user;
+        m.parts.push_back({MessagePart::Type::Text, text, ""});
+        return m;
+    };
+    CHECK(BotFilter::reason(from("Nightbot"), bots) == "known bot");
+    CHECK(BotFilter::reason(from("@BotRix"), bots) == "known bot");
+    CHECK(BotFilter::reason(from("StreamElements"), bots) == "known bot");
+    CHECK(BotFilter::reason(from("coolchannel_bot"), bots) == "name ends with bot");
+    CHECK(BotFilter::reason(from("RealViewer"), bots).empty());
+    CHECK(BotFilter::reason(from("bot"), bots).empty()); // too short for the suffix rule
+
+    auto badge = from("Helper");
+    badge.roles.push_back("bot");
+    CHECK(BotFilter::reason(badge, bots) == "bot badge");
+
+    bots["allowedUsers"] = json::array({"Abbot"});
+    CHECK(BotFilter::reason(from("abbot"), bots).empty());
+
+    bots["customBots"] = json::array({"MyHelper"});
+    CHECK(BotFilter::reason(from("myhelper"), bots) == "custom bot list");
+
+    CHECK(BotFilter::reason(from("viewer", "!uptime"), bots).empty());
+    bots["hideCommands"] = true;
+    CHECK(BotFilter::reason(from("viewer", "!uptime"), bots) == "chat command");
+
+    bots["enabled"] = false;
+    CHECK(BotFilter::reason(from("Nightbot"), bots).empty());
+}
+
 void testUtil() {
     CHECK(util::utf8Length("سلام") == 4);
     auto parts = util::splitForSpeech(std::string(250, 'a') + " " + std::string(10, 'b'), 180);
@@ -169,6 +204,7 @@ int main() {
     testYouTubeIds();
     testPipelineDecisions();
     testUtil();
+    testBotFilter();
     testSettingsSanitize();
     if (failures) {
         std::cerr << failures << " check(s) failed\n";

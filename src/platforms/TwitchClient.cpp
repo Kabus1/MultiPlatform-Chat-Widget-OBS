@@ -166,6 +166,7 @@ ChatMessage TwitchClient::toChatMessage(const IrcLine& l) {
     if (has("vip/")) m.roles.push_back("vip");
     if (has("subscriber/") || has("founder/")) m.roles.push_back("subscriber");
     if (has("partner/")) m.roles.push_back("verified");
+    if (has("bot-badge/")) m.roles.push_back("bot");
 
     // emotes tag: "25:0-4,12-16/1902:6-10" (code point offsets, inclusive).
     struct Range { size_t start, end; std::string id; };

@@ -1,7 +1,7 @@
 {
   "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
   "name": "unified-stream-chat",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Unified YouTube / Twitch / Kick chat dock for OBS with Google Translate and TTS.",
   "homepage": "https://github.com/kabus1/MultiPlatform-Chat-Widget-OBS",
   "license": "MIT",

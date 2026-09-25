@@ -7,6 +7,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <deque>
+#include <functional>
 #include <mutex>
 #include <thread>
 
@@ -26,6 +27,10 @@ public:
     void start();
     void stop();
     void submit(ChatMessage m);
+
+    // Receives TTS segments when audio.output == "app" (native playback).
+    void setSpeechSink(std::function<void(const nlohmann::json&)> sink) { speechSink_ = std::move(sink); }
+    uint64_t botsFiltered() const { return botsFiltered_; }
 
     // Pure decision logic, separated so it can be unit-tested without network.
     struct Decision {
@@ -50,6 +55,8 @@ private:
     std::condition_variable cv_;
     std::deque<ChatMessage> queue_;
     uint64_t seq_ = 0;
+    std::function<void(const nlohmann::json&)> speechSink_;
+    std::atomic<uint64_t> botsFiltered_{0};
 };
 
 } // namespace usc

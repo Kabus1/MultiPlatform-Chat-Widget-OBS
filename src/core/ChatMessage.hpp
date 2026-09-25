@@ -33,7 +33,8 @@ struct ChatMessage {
     std::string detectedLang;
     std::string translation;
     bool showTranslation = false;
-    nlohmann::json tts; // null, or [{text, lang}, ...] segments to be spoken by the dock
+    nlohmann::json tts; // null, or [{text, lang}, ...] segments to be spoken
+    std::string ttsTarget; // "app" (native player) or "browser" (dock page plays it)
 
     // Full message text with emote names inline.
     std::string plainText() const;
@@ -94,6 +95,7 @@ inline nlohmann::json ChatMessage::toJson() const {
         {"lang", detectedLang},
         {"translation", showTranslation ? translation : std::string()},
         {"tts", tts},
+        {"ttsTarget", ttsTarget},
     };
 }
 

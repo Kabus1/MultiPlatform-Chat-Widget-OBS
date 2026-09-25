@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(UnifiedStreamChat VERSION 0.2.0 LANGUAGES CXX)
+project(UnifiedStreamChat VERSION 0.3.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -63,6 +63,63 @@ if(NOT WIN32)
   endif()
 endif()
 
+# miniaudio (single header): lists audio output devices and plays TTS natively.
+FetchContent_Declare(miniaudio
+  GIT_REPOSITORY https://github.com/mackron/miniaudio.git
+  GIT_TAG 0.11.25
+  GIT_SHALLOW ON)
+FetchContent_GetProperties(miniaudio)
+if(NOT miniaudio_POPULATED)
+  FetchContent_Populate(miniaudio) # header only: no add_subdirectory
+endif()
+
+# --- Native desktop window (webview: WebView2 / WKWebView / WebKitGTK) ------
+# Windows and macOS always get the window. Linux gets it when WebKitGTK
+# development files are installed; otherwise the build is server-only.
+set(USC_DESKTOP_DEFAULT ON)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  find_package(PkgConfig QUIET)
+  if(PkgConfig_FOUND)
+    pkg_search_module(USC_WEBKITGTK QUIET webkit2gtk-4.1 webkit2gtk-4.0)
+  endif()
+  if(NOT USC_WEBKITGTK_FOUND)
+    set(USC_DESKTOP_DEFAULT OFF)
+    message(STATUS "WebKitGTK not found: building without the desktop window (server/OBS mode only)")
+  endif()
+endif()
+option(USC_DESKTOP_WINDOW "Build the native desktop window" ${USC_DESKTOP_DEFAULT})
+
+if(USC_DESKTOP_WINDOW)
+  if(WIN32)
+    # WebView2 SDK headers come from NuGet (downloaded, nothing to install).
+    # The app ships webview's built-in loader, so no WebView2Loader.dll.
+    set(USC_WEBVIEW2_VERSION 1.0.2903.40)
+    FetchContent_Declare(mswebview2
+      URL https://api.nuget.org/v3-flatcontainer/microsoft.web.webview2/${USC_WEBVIEW2_VERSION}/microsoft.web.webview2.${USC_WEBVIEW2_VERSION}.nupkg
+      DOWNLOAD_NAME webview2.zip
+      DOWNLOAD_EXTRACT_TIMESTAMP ON)
+    FetchContent_GetProperties(mswebview2)
+    if(NOT mswebview2_POPULATED)
+      FetchContent_Populate(mswebview2)
+    endif()
+    set(MSWebView2_ROOT ${mswebview2_SOURCE_DIR} CACHE PATH "" FORCE)
+    set(WEBVIEW_MSWEBVIEW2_VERSION ${USC_WEBVIEW2_VERSION} CACHE STRING "" FORCE)
+    if(MINGW)
+      set(WEBVIEW_USE_COMPAT_MINGW ON CACHE BOOL "" FORCE)
+    endif()
+  endif()
+  foreach(opt WEBVIEW_BUILD_TESTS WEBVIEW_BUILD_EXAMPLES WEBVIEW_BUILD_DOCS WEBVIEW_INSTALL_DOCS
+              WEBVIEW_INSTALL_TARGETS WEBVIEW_BUILD_SHARED_LIBRARY WEBVIEW_BUILD_STATIC_LIBRARY
+              WEBVIEW_ENABLE_CHECKS WEBVIEW_ENABLE_CLANG_FORMAT WEBVIEW_ENABLE_CLANG_TIDY WEBVIEW_ENABLE_PACKAGING)
+    set(${opt} OFF CACHE BOOL "" FORCE)
+  endforeach()
+  FetchContent_Declare(webview
+    GIT_REPOSITORY https://github.com/webview/webview.git
+    GIT_TAG 0.12.0
+    GIT_SHALLOW ON)
+  FetchContent_MakeAvailable(webview)
+endif()
+
 # --- Embed the dock UI (web/*) into the binary -----------------------------
 set(WEB_FILES
   ${CMAKE_CURRENT_SOURCE_DIR}/web/index.html
@@ -86,32 +143,44 @@ add_library(usc_core STATIC
   src/core/MessagePipeline.cpp
   src/core/EventHub.cpp
   src/core/Util.cpp
+  src/core/BotFilter.cpp
   src/net/OAuth.cpp
   src/platforms/TwitchClient.cpp
   src/platforms/YouTubeClient.cpp
   src/platforms/KickClient.cpp
   src/services/Translator.cpp
   src/services/TtsService.cpp
+  src/services/AudioPlayer.cpp
+  src/services/miniaudio_impl.cpp
+  src/desktop/DesktopWindow.cpp
   src/server/WebServer.cpp
   ${EMBED_OUT})
 
 target_include_directories(usc_core PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/src
-  ${httplib_SOURCE_DIR})
+  ${httplib_SOURCE_DIR}
+  ${miniaudio_SOURCE_DIR})
 
 target_compile_definitions(usc_core PUBLIC
   CPPHTTPLIB_THREAD_POOL_COUNT=16
   APP_VERSION="${PROJECT_VERSION}")
 
-target_link_libraries(usc_core PUBLIC nlohmann_json::nlohmann_json Threads::Threads)
+target_link_libraries(usc_core PUBLIC nlohmann_json::nlohmann_json Threads::Threads ${CMAKE_DL_LIBS})
+if(USC_DESKTOP_WINDOW)
+  target_compile_definitions(usc_core PUBLIC USC_HAS_WEBVIEW)
+  target_link_libraries(usc_core PUBLIC webview::core)
+endif()
+if(NOT WIN32 AND NOT APPLE)
+  target_link_libraries(usc_core PUBLIC m)
+endif()
 
 if(WIN32)
   target_sources(usc_core PRIVATE
     src/net/Http_winhttp.cpp
     src/net/WebSocketClient_winhttp.cpp)
   target_compile_definitions(usc_core PUBLIC
-    NOMINMAX WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00 UNICODE _UNICODE)
-  target_link_libraries(usc_core PUBLIC winhttp ws2_32 shell32)
+    NOMINMAX WIN32_LEAN_AND_MEAN= _WIN32_WINNT=0x0A00 UNICODE _UNICODE) # empty value matches webview.h
+  target_link_libraries(usc_core PUBLIC winhttp ws2_32 shell32 ole32 user32)
 else()
   target_sources(usc_core PRIVATE
     src/net/Http_httplib.cpp
@@ -120,7 +189,8 @@ else()
   target_link_libraries(usc_core PUBLIC ixwebsocket::ixwebsocket OpenSSL::SSL OpenSSL::Crypto)
   if(APPLE)
     target_compile_definitions(usc_core PUBLIC CPPHTTPLIB_USE_CERTS_FROM_MACOSX_KEYCHAIN)
-    target_link_libraries(usc_core PUBLIC "-framework CoreFoundation" "-framework Security")
+    target_link_libraries(usc_core PUBLIC "-framework CoreFoundation" "-framework Security"
+      "-framework CoreAudio" "-framework AudioToolbox")
   endif()
 endif()
 
@@ -139,6 +209,14 @@ add_executable(unified_stream_chat src/main.cpp)
 target_link_libraries(unified_stream_chat PRIVATE usc_core)
 if(WIN32)
   set_target_properties(unified_stream_chat PROPERTIES OUTPUT_NAME UnifiedStreamChat)
+  if(USC_DESKTOP_WINDOW)
+    # A windowed app: no console pops up (logs go to app.log, or to the
+    # terminal when started from one). Keeps the standard main() entry.
+    set_target_properties(unified_stream_chat PROPERTIES WIN32_EXECUTABLE ON)
+    if(MSVC)
+      target_link_options(unified_stream_chat PRIVATE /ENTRY:mainCRTStartup)
+    endif()
+  endif()
   if(MSVC)
     set_property(TARGET unified_stream_chat PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
     set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT unified_stream_chat)
