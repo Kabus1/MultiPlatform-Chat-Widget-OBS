@@ -17,8 +17,10 @@ class TtsService;
 
 // Native TTS playback (miniaudio): lists the system's audio output devices
 // and plays Google TTS audio on the device chosen in settings.audio.
-// The device is remembered by name, so the choice survives restarts and
-// device re-ordering; if it is unplugged the system default is used.
+// The device is remembered in settings.json by its system id (WASAPI endpoint
+// id / CoreAudio UID / ALSA or Pulse name) with its display name as a
+// fallback. It is restored and opened as soon as the app starts; if it is
+// unplugged the system default is used until it comes back.
 class AudioPlayer {
 public:
     AudioPlayer(Settings& settings, TtsService& tts);
@@ -31,6 +33,8 @@ public:
     nlohmann::json devices();
 
     void enqueue(const nlohmann::json& segments); // [{text, lang}, ...]
+    // Re-opens the output device from settings right away (after a change).
+    void reapplyDevice();
     void skip();   // stop the message being spoken now
     void clear();  // drop everything queued and stop
 
@@ -38,7 +42,8 @@ private:
     struct Engine;
     void run();
     bool playSegment(const std::string& text, const std::string& lang, const nlohmann::json& s);
-    bool ensureEngine(const std::string& deviceName, std::string& error);
+    bool ensureEngine(const std::string& deviceId, const std::string& deviceName, std::string& error);
+    void applySavedDevice(bool startup);
     void releaseEngine();
 
     Settings& settings_;
@@ -47,6 +52,7 @@ private:
     std::thread worker_;
     std::atomic<bool> running_{false};
     std::atomic<bool> skip_{false};
+    std::atomic<bool> reopen_{false};
     std::mutex mutex_;
     std::condition_variable cv_;
     std::deque<nlohmann::json> queue_;

@@ -152,6 +152,7 @@ ChatMessage TwitchClient::toChatMessage(const IrcLine& l) {
 
     m.id = tag(l, "id");
     m.userId = tag(l, "user-id");
+    m.channelId = tag(l, "room-id");
     m.username = l.prefix.substr(0, l.prefix.find('!'));
     m.displayName = tag(l, "display-name");
     if (m.displayName.empty()) m.displayName = m.username;

@@ -32,10 +32,21 @@ It also translates messages with Google Translate and reads them aloud with Goog
   - reading the message text
   - reading the original text or the translation
   - skipping messages longer than a character limit you set
-  - skipping `!commands` and links
   - choosing which platforms are read aloud
   - volume, speed and queue size
-- **Audio output device.** Settings → Voice → Audio output lists every output device on your system (speakers, headsets, virtual cables). Pick one, and optionally the **left or right channel only**. The choice is saved in `settings.json` and used again after restarts. If the device is unplugged, the system default is used until it comes back.
+- **Clean speech.** TTS never reads:
+  - **emotes:** Twitch and Kick native emotes; **7TV, BTTV and FFZ** emotes (global and your channel's, which are also shown as images in chat); Kick `[emote:…]` tokens; YouTube `:shortcodes:`; a built-in list of common emote words; emote-code style words such as `catJAM` or `xqcL`; and your own word list
+  - **emoji, symbols and ASCII/braille art**, including in usernames
+  - **messages with links** (`https://`, `www.`, and bare domains such as `discord.gg/…`). These are skipped entirely.
+  - **bots** (Nightbot, BotRix, …), even when the bot filter's chat display is off
+  - `!commands`
+
+  A message that is only emotes or emoji is not read at all, not even the username.
+- **Audio output device.** Settings → Voice → Audio output lists every output device on your system (speakers, headsets, virtual cables). Pick one, and optionally the **left or right channel only**.
+  - The choice is saved in `settings.json` as `audio.deviceId` (the system's stable device ID, e.g. the WASAPI endpoint ID) plus `audio.deviceName`.
+  - Each time the app starts, it restores and opens that device right away.
+  - It matches by ID first, then by name, and updates the file if either one changed.
+  - If the device is unplugged, the system default is used until it comes back.
 - **Bot filter.** Messages from chat bots (Nightbot, BotRix, StreamElements, Streamlabs, Moobot, Fossabot and more) are dropped completely: never shown, translated or read aloud. Detection uses:
   - a built-in list you can edit
   - your own extra list
@@ -138,9 +149,10 @@ Nothing is needed by default: the app uses Google's public Translate and Transla
 For every live message from a real user (the backlog loaded when the app connects is never read aloud), the app:
 
 1. Skips the message if TTS is off, the platform is excluded, the user is on the ignored list, or the message is a `!command`.
-2. Removes links (if that option is on). Skips the message **entirely** if it is longer than *Skip messages longer than* characters.
-3. Picks the text to read: the **original** in its detected language, or the **translated** text in the target language.
-4. Builds the speech from the username phrase and/or the message text, based on your toggles.
+2. Skips the message entirely if it contains a link. Otherwise, removes emotes, emoji and symbols (see *Clean speech*). If nothing readable is left, the message is skipped.
+3. Skips the message **entirely** if the remaining text is longer than *Skip messages longer than* characters.
+4. Picks the text to read: the **original** in its detected language, or the **translated** text in the target language.
+5. Builds the speech from the username phrase and/or the message text, based on your toggles.
 
 The backend fetches the MP3 from Google. By default it plays the speech itself (miniaudio) on the chosen output device and channel. With *Audio output → page*, or with the `?tts=1` link, the page plays it through `/api/tts` instead.
 
@@ -154,7 +166,9 @@ CMakePresets.json         Visual Studio / command-line configurations
 vcpkg.json                optional vcpkg manifest (pinned baseline)
 cmake/EmbedAssets.cmake   web/* -> generated C++ byte arrays
 src/main.cpp              CLI entry point
-src/core/                 App (wiring), Settings, TokenStore, MessagePipeline, BotFilter, EventHub (SSE), Util
+src/core/                 App (wiring), Settings, TokenStore, MessagePipeline, BotFilter,
+                          TtsTextFilter (emote/emoji/link cleaning), EmoteRegistry (7TV/BTTV/FFZ),
+                          EventHub (SSE), Util
 src/net/                  HTTPS client + WebSocket client (WinHTTP on Windows,
                           cpp-httplib/IXWebSocket + OpenSSL elsewhere), OAuth2 flow
 src/platforms/            TwitchClient, YouTubeClient, KickClient

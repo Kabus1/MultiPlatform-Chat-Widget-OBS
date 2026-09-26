@@ -57,7 +57,12 @@ json Settings::defaults() {
             {"usernameTemplate", "{user}:"},
             {"maxChars", 200},             // longer messages are skipped entirely (0 = no limit)
             {"skipCommands", true},        // messages starting with '!'
-            {"skipLinks", true},           // replace URLs with nothing
+            {"skipLinkMessages", true},    // never read a message that contains a link
+            {"skipLinks", true},           // (if the above is off) remove URLs from the text
+            {"skipBots", true},            // never read bots, even if the bot filter display is off
+            {"stripEmoji", true},          // remove emoji / symbols before speaking
+            {"guessEmoteWords", true},     // drop "catJAM"-style emote codes (Twitch/Kick)
+            {"emoteWords", json::array()}, // extra words never to read
             {"volume", 1.0},
             {"rate", 1.0},
             {"maxQueue", 10},
@@ -70,6 +75,7 @@ json Settings::defaults() {
             // "browser": the dock / window page plays it (old behaviour).
             {"output", "app"},
             {"deviceName", ""},   // empty = system default output device
+            {"deviceId", ""},     // backend device id (preferred match; name is the fallback)
             {"channel", "both"},  // "both" | "left" | "right"
             {"muted", false},
         }},
@@ -102,6 +108,7 @@ json Settings::defaults() {
             {"useUserColors", true},
             {"showTimestamps", false},
             {"showBadges", true},
+            {"thirdPartyEmotes", true}, // 7TV / BTTV / FFZ emotes shown as images
             {"maxMessages", 150},
             {"animate", true},
             {"colors", {{"twitch", "#9146FF"}, {"youtube", "#FF0033"}, {"kick", "#53FC18"}}},

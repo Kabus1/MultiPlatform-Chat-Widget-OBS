@@ -1,5 +1,7 @@
 // Minimal self-contained unit tests (no network): run with `ctest` or directly.
 #include "core/BotFilter.hpp"
+#include "core/EmoteRegistry.hpp"
+#include "core/TtsTextFilter.hpp"
 #include "core/MessagePipeline.hpp"
 #include "core/Settings.hpp"
 #include "core/Util.hpp"
@@ -175,6 +177,100 @@ void testBotFilter() {
     CHECK(BotFilter::reason(from("Nightbot"), bots).empty());
 }
 
+void testTtsTextFilter() {
+    TtsTextFilter::Options o;
+    // Emoji, Kick tokens, YouTube shortcodes, built-in and guessed emote words.
+    CHECK(TtsTextFilter::clean("hello 😂😂 world 🇸🇦", o) == "hello world");
+    CHECK(TtsTextFilter::clean("gg [emote:37226:KEKW] nice", o) == "gg nice");
+    CHECK(TtsTextFilter::clean("hi :face-blue-smiling: there", o) == "hi there");
+    CHECK(TtsTextFilter::clean("KEKW that was OMEGALUL funny", o) == "that was funny");
+    CHECK(TtsTextFilter::clean("catJAM monkaS xqcL lets go", o) == "lets go");
+    CHECK(TtsTextFilter::clean("I love my iPhone and eBay", o) == "I love my iPhone and eBay"); // not emote codes
+    CHECK(TtsTextFilter::clean("😂 KEKW 🔥", o).empty());      // nothing left to read
+    CHECK(TtsTextFilter::clean("⣿⣿⣿⣿ ⠀⠀", o).empty());         // braille ASCII art
+    CHECK(TtsTextFilter::clean("السلام عليكم 🌹", o) == "السلام عليكم");
+    o.extraEmoteWords = json::array({"myEmote"});
+    CHECK(TtsTextFilter::clean("wow myemote", o) == "wow");
+    o.guessEmoteWords = false;
+    CHECK(TtsTextFilter::clean("lirikHYPE", o) == "lirikHYPE"); // guessing off
+
+    EmoteRegistry reg;
+    reg.add("twitch:42", {{"Clap", "https://cdn/1"}});
+    TtsTextFilter::Options r;
+    r.registry = &reg;
+    r.platform = "twitch";
+    r.channelId = "42";
+    CHECK(TtsTextFilter::clean("nice Clap stream", r) == "nice stream");
+    r.channelId = "other";
+    CHECK(TtsTextFilter::clean("nice Clap stream", r) == "nice Clap stream"); // channel-specific
+
+    // Link detection.
+    CHECK(TtsTextFilter::containsLink("go to https://example.com now"));
+    CHECK(TtsTextFilter::containsLink("join discord.gg/abc"));
+    CHECK(TtsTextFilter::containsLink("www.site.org"));
+    CHECK(TtsTextFilter::containsLink("follow me on instagram.com/x"));
+    CHECK(TtsTextFilter::containsLink("youtu.be/dQw4w9WgXcQ"));
+    CHECK(!TtsTextFilter::containsLink("version 3.5 is out, e.g. today"));
+    CHECK(!TtsTextFilter::containsLink("email me at name@site"));
+    CHECK(!TtsTextFilter::containsLink("just do it. ok"));
+}
+
+void testEmoteRegistry() {
+    json seventv = {{"emote_set", {{"emotes", json::array({{{"id", "abc"}, {"name", "catJAM"}}})}}}};
+    auto l = EmoteRegistry::parse7tv(seventv);
+    CHECK(l.size() == 1 && l[0].first == "catJAM" && l[0].second == "https://cdn.7tv.app/emote/abc/1x.webp");
+    json bttv = {{"channelEmotes", json::array({{{"id", "1"}, {"code", "Clap"}}})},
+                 {"sharedEmotes", json::array({{{"id", "2"}, {"code", "RareParrot"}}})}};
+    CHECK(EmoteRegistry::parseBttv(bttv).size() == 2);
+    json ffz = {{"sets", {{"3", {{"emoticons", json::array({{{"name", "ZrehplaR"}, {"urls", {{"1", "//cdn.ffz/1"}}}}})}}}}}};
+    auto f = EmoteRegistry::parseFfz(ffz);
+    CHECK(f.size() == 1 && f[0].second == "https://cdn.ffz/1");
+
+    EmoteRegistry reg;
+    reg.add("", l);
+    ChatMessage m = sample("so good catJAM catJAM wow");
+    MessagePipeline::markThirdPartyEmotes(m, reg);
+    CHECK(m.parts.size() == 5);
+    CHECK(m.parts[1].type == MessagePart::Type::Emote && m.parts[1].text == "catJAM");
+    CHECK(m.speakableText() == "so good wow");
+    CHECK(m.plainText() == "so good catJAM catJAM wow");
+}
+
+void testTtsSkipRules() {
+    json s = Settings::defaults();
+    s["tts"]["enabled"] = true;
+
+    // Messages with links are skipped entirely.
+    CHECK(MessagePipeline::decide(sample("check https://x.com/a now"), s, "check https://x.com/a now", true, "", "en").tts.is_null());
+    CHECK(MessagePipeline::decide(sample("join discord.gg/abc"), s, "join discord.gg/abc", true, "", "en").tts.is_null());
+    s["tts"]["skipLinkMessages"] = false; // then only the link is removed
+    auto d = MessagePipeline::decide(sample("check https://x.com/a now"), s, "check https://x.com/a now", true, "", "en");
+    CHECK(d.tts.size() == 2 && d.tts[1]["text"] == "check now");
+    s["tts"]["skipLinkMessages"] = true;
+
+    // Bots are never read even when the display filter is off.
+    s["bots"]["enabled"] = false;
+    auto bot = sample("Follow the channel!");
+    bot.username = bot.displayName = "Nightbot";
+    CHECK(MessagePipeline::decide(bot, s, "Follow the channel!", true, "", "en").tts.is_null());
+    bot.username = bot.displayName = "BotRix";
+    CHECK(MessagePipeline::decide(bot, s, "Follow the channel!", true, "", "en").tts.is_null());
+    s["tts"]["skipBots"] = false;
+    CHECK(!MessagePipeline::decide(bot, s, "Follow the channel!", true, "", "en").tts.is_null());
+    s["tts"]["skipBots"] = true;
+
+    // Emote-only message: nothing is read (not even the username).
+    CHECK(MessagePipeline::decide(sample("KEKW 😂"), s, "KEKW 😂", true, "", "en").tts.is_null());
+    // Emotes are removed from the spoken text.
+    d = MessagePipeline::decide(sample("that was PogChamp amazing 🔥"), s, "that was PogChamp amazing 🔥", true, "", "en");
+    CHECK(d.tts.size() == 2 && d.tts[1]["text"] == "that was amazing");
+    // Emoji in usernames are not read; underscores become spaces.
+    auto fancy = sample("hello");
+    fancy.displayName = "🔥Sara_Gamer🔥";
+    d = MessagePipeline::decide(fancy, s, "hello", true, "", "en");
+    CHECK(d.tts[0]["text"] == "Sara Gamer:");
+}
+
 void testUtil() {
     CHECK(util::utf8Length("سلام") == 4);
     auto parts = util::splitForSpeech(std::string(250, 'a') + " " + std::string(10, 'b'), 180);
@@ -205,6 +301,9 @@ int main() {
     testPipelineDecisions();
     testUtil();
     testBotFilter();
+    testTtsTextFilter();
+    testEmoteRegistry();
+    testTtsSkipRules();
     testSettingsSanitize();
     if (failures) {
         std::cerr << failures << " check(s) failed\n";

@@ -16,12 +16,13 @@ namespace usc {
 class Settings;
 class EventHub;
 class Translator;
+class EmoteRegistry;
 
 // Enriches every incoming chat message (language detection, translation line,
 // TTS segments) on a worker thread, then publishes it to the dock.
 class MessagePipeline {
 public:
-    MessagePipeline(Settings& settings, EventHub& hub, Translator& translator);
+    MessagePipeline(Settings& settings, EventHub& hub, Translator& translator, EmoteRegistry* emotes = nullptr);
     ~MessagePipeline();
 
     void start();
@@ -38,7 +39,10 @@ public:
         nlohmann::json tts; // null or [{text, lang}]
     };
     static Decision decide(const ChatMessage& m, const nlohmann::json& settings, const std::string& speakText,
-                           bool translated, const std::string& translation, const std::string& detectedLang);
+                           bool translated, const std::string& translation, const std::string& detectedLang,
+                           const EmoteRegistry* emotes = nullptr);
+    // Turns words that are 7TV / BTTV / FFZ emotes into emote parts.
+    static void markThirdPartyEmotes(ChatMessage& m, const EmoteRegistry& emotes);
     static bool wantsLookup(const ChatMessage& m, const nlohmann::json& settings);
     static std::string stripLinks(const std::string& text);
 
@@ -49,6 +53,7 @@ private:
     Settings& settings_;
     EventHub& hub_;
     Translator& translator_;
+    EmoteRegistry* emotes_;
     std::thread worker_;
     std::atomic<bool> running_{false};
     std::mutex mutex_;

@@ -43,6 +43,7 @@ private:
     StatusSink onStatus_;
     std::unique_ptr<WebSocketClient> ws_;
     std::string chatroomId_;
+    std::string channelUserId_; // broadcaster's Kick user id (7TV emotes)
     std::thread resolver_;
     std::atomic<bool> running_{false};
     std::mutex mutex_;

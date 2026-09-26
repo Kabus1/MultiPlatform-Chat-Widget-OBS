@@ -445,30 +445,51 @@
       $('#audio-status').textContent = 'Cannot list audio devices: ' + e.message;
       return;
     }
-    const saved = settings.audio.deviceName;
+    // Option values are the stable device id (falls back to the name).
+    const savedId = settings.audio.deviceId || '';
+    const savedName = settings.audio.deviceName || '';
+    const devices = info.devices || [];
     sel.textContent = '';
     sel.append(new Option('System default output', ''));
-    for (const d of info.devices || []) sel.append(new Option(d.name + (d.isDefault ? '  (default)' : ''), d.name));
-    if (saved && !(info.devices || []).some((d) => d.name === saved)) {
-      // Keep the saved choice visible even while it is unplugged.
-      sel.append(new Option(saved + '  (not connected)', saved));
+    for (const d of devices) {
+      const o = new Option(d.name + (d.isDefault ? '  (default)' : ''), d.id || 'name:' + d.name);
+      o.dataset.name = d.name;
+      o.dataset.id = d.id || '';
+      sel.append(o);
     }
-    sel.value = saved;
+    const current = devices.find((d) => (savedId && d.id === savedId)) || devices.find((d) => savedName && d.name === savedName);
+    if (current) {
+      sel.value = current.id || 'name:' + current.name;
+    } else if (savedName || savedId) {
+      // Keep the saved choice visible even while it is unplugged.
+      const o = new Option((savedName || savedId) + '  (not connected)', savedId || 'name:' + savedName);
+      o.dataset.name = savedName;
+      o.dataset.id = savedId;
+      sel.append(o);
+      sel.value = o.value;
+    } else {
+      sel.value = '';
+    }
     const st = $('#audio-status');
     st.classList.toggle('warn-text', !!info.missing || !!info.error);
     if (info.error) st.textContent = info.error;
-    else if (info.missing) st.textContent = `"${saved}" is not connected right now, the system default is used until it is back.`;
-    else st.textContent = `${(info.devices || []).length} output device(s) found` + (info.backend ? ` via ${info.backend}.` : '.');
+    else if (info.missing) st.textContent = `"${savedName}" is not connected right now, the system default is used until it is back.`;
+    else st.textContent = `${devices.length} output device(s) found` + (info.backend ? ` via ${info.backend}` : '') +
+      (savedName ? `. Saved choice "${savedName}" is restored every time the app starts.` : '.');
   }
   $('#audio-refresh').addEventListener('click', loadDevices);
   $('#audio-device').addEventListener('change', async (e) => {
-    settings = await api('/api/settings', { method: 'POST', body: { audio: { deviceName: e.target.value } } });
+    const o = e.target.selectedOptions[0];
+    const audio = o && o.value ? { deviceId: o.dataset.id || '', deviceName: o.dataset.name || '' } : { deviceId: '', deviceName: '' };
+    settings = await api('/api/settings', { method: 'POST', body: { audio } });
     loadDevices();
   });
   function updateAudioUi() {
     $('.app-audio').style.display = settings.audio.output === 'app' ? '' : 'none';
     const sel = $('#audio-device');
-    if ([...sel.options].some((o) => o.value === settings.audio.deviceName)) sel.value = settings.audio.deviceName;
+    const match = [...sel.options].find((o) => o.value && ((settings.audio.deviceId && o.dataset.id === settings.audio.deviceId) ||
+      (!settings.audio.deviceId && o.dataset.name === settings.audio.deviceName)));
+    sel.value = match ? match.value : (settings.audio.deviceName || settings.audio.deviceId ? sel.value : '');
   }
 
   // ------------------------------------------------------------------ links

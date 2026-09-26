@@ -115,6 +115,7 @@
         <label class="check"><input type="checkbox" data-key="ui.showPlatformColors"> Show platform color code</label>
         <label class="check"><input type="checkbox" data-key="ui.useUserColors"> Use each user's own name color</label>
         <label class="check"><input type="checkbox" data-key="ui.showBadges"> Show role badges (mod, sub, VIP...)</label>
+        <label class="check"><input type="checkbox" data-key="ui.thirdPartyEmotes"> Show 7TV / BTTV / FFZ emotes as images</label>
         <label class="check"><input type="checkbox" data-key="ui.showTimestamps"> Show timestamps</label>
         <div class="color-row">
           <label><span class="logo" data-logo="twitch"></span>Twitch<input type="color" data-key="ui.colors.twitch"></label>
@@ -191,7 +192,12 @@
         <h4>Filters</h4>
         <label>Skip messages longer than (characters, 0 = never)<input type="number" min="0" max="2000" data-key="tts.maxChars"></label>
         <label class="check"><input type="checkbox" data-key="tts.skipCommands"> Skip !commands</label>
-        <label class="check"><input type="checkbox" data-key="tts.skipLinks"> Don't read links</label>
+        <label class="check"><input type="checkbox" data-key="tts.skipLinkMessages"> Skip any message that contains a link</label>
+        <label class="check"><input type="checkbox" data-key="tts.skipBots"> Never read bots (even if they are shown in chat)</label>
+        <label class="check"><input type="checkbox" data-key="tts.stripEmoji"> Don't read emoji and symbols</label>
+        <label class="check"><input type="checkbox" data-key="tts.guessEmoteWords"> Don't read emote codes (catJAM, monkaS, xqcL…)</label>
+        <label>Extra words never to read <small>(one per line, e.g. channel emotes)</small><textarea rows="2" data-key="tts.emoteWords" data-type="list" placeholder="myEmote"></textarea></label>
+        <p class="hint">Twitch, Kick, 7TV, BTTV and FFZ emotes are always removed from speech.</p>
         <div class="inline-checks">Read messages from:
           <label class="check"><input type="checkbox" data-key="tts.platforms.twitch"> Twitch</label>
           <label class="check"><input type="checkbox" data-key="tts.platforms.youtube"> YouTube</label>

@@ -19,6 +19,7 @@ struct ChatMessage {
     std::string id;
     std::string platform; // "twitch" | "youtube" | "kick"
     std::string channel;
+    std::string channelId;   // platform id of the channel (third-party emote lookup)
     std::string userId;
     std::string username;    // login / handle
     std::string displayName; // what is shown in chat

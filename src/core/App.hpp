@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/EmoteRegistry.hpp"
 #include "core/EventHub.hpp"
 #include "core/MessagePipeline.hpp"
 #include "core/Settings.hpp"
@@ -64,6 +65,7 @@ private:
     TokenStore tokens_;
     EventHub hub_;
     Translator translator_;
+    EmoteRegistry emotes_; // must be declared before pipeline_
     TtsService tts_;
     MessagePipeline pipeline_;
     AudioPlayer audio_;

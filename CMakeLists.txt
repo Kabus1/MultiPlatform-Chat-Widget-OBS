@@ -144,6 +144,8 @@ add_library(usc_core STATIC
   src/core/EventHub.cpp
   src/core/Util.cpp
   src/core/BotFilter.cpp
+  src/core/TtsTextFilter.cpp
+  src/core/EmoteRegistry.cpp
   src/net/OAuth.cpp
   src/platforms/TwitchClient.cpp
   src/platforms/YouTubeClient.cpp

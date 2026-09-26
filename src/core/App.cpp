@@ -21,7 +21,7 @@ App::App(const std::string& configDir, int portOverride)
     : settings_((std::filesystem::path(configDir) / "settings.json").string()),
       tokens_((std::filesystem::path(configDir) / "tokens.json").string()),
       hub_(100),
-      pipeline_(settings_, hub_, translator_),
+      pipeline_(settings_, hub_, translator_, &emotes_),
       audio_(settings_, tts_) {
     pipeline_.setSpeechSink([this](const json& segments) { audio_.enqueue(segments); });
     settings_.load();
@@ -34,8 +34,9 @@ App::App(const std::string& configDir, int portOverride)
 App::~App() { shutdown(); }
 
 void App::start() {
-    audio_.start();
+    audio_.start(); // also restores and opens the saved output device
     pipeline_.start();
+    if (settings_.snapshot()["ui"].value("thirdPartyEmotes", true)) emotes_.loadGlobalAsync();
     for (const char* p : kPlatforms) restartPlatform(p);
 }
 
@@ -211,6 +212,12 @@ json App::applySettings(const json& patch) {
     if ((s["audio"].value("muted", false) && !before.value("muted", false)) ||
         s["audio"].value("output", "") != before.value("output", ""))
         audio_.clear();
+    // A newly chosen speaker is opened immediately, not on the next message.
+    if (s["audio"].value("deviceId", "") != before.value("deviceId", "") ||
+        s["audio"].value("deviceName", "") != before.value("deviceName", "") ||
+        s["audio"].value("output", "") != before.value("output", ""))
+        audio_.reapplyDevice();
+    if (s["ui"].value("thirdPartyEmotes", true)) emotes_.loadGlobalAsync(); // no-op once loaded
     // Only reconnect the platforms whose connection settings actually changed.
     for (const char* p : kPlatforms) {
         bool changed;
@@ -288,6 +295,9 @@ void App::injectTestMessages() {
                           {{T::Text, "What settings are you using for this game? ", ""},
                            {T::Emote, "KEKW", "https://files.kick.com/emotes/37226/fullsize"}},
                           {"moderator"}));
+    // Shown in chat, but never read aloud: contains a link.
+    pipeline_.submit(make("kick", "RocketFan99", "#53FC18",
+                          {{T::Text, "Clip of that play 🔥 kick.com/rocketfan99/clips", ""}}, {}));
     // Should never appear: removed by the bot filter (when enabled).
     pipeline_.submit(make("twitch", "Nightbot", "#7C7CE1",
                           {{T::Text, "Follow the channel! Type !discord for the server link.", ""}}, {"moderator"}));

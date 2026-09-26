@@ -56,6 +56,8 @@ std::string KickClient::lookupChatroomId(std::string& error) {
         }
         try {
             json j = json::parse(r.body);
+            if (j.contains("user_id") && j["user_id"].is_number())
+                channelUserId_ = std::to_string(j["user_id"].get<int64_t>());
             if (j.contains("chatroom") && j["chatroom"].contains("id")) {
                 const json& id = j["chatroom"]["id"];
                 return id.is_number() ? std::to_string(id.get<int64_t>()) : id.get<std::string>();
@@ -123,7 +125,10 @@ void KickClient::onText(const std::string& payload, WebSocketClient& ws) {
         try {
             // Pusher double-encodes: data is a JSON string.
             json data = j["data"].is_string() ? json::parse(j["data"].get<std::string>()) : j["data"];
-            if (auto m = parseChatEvent(data)) onMessage_(std::move(*m));
+            if (auto m = parseChatEvent(data)) {
+                m->channelId = channelUserId_;
+                onMessage_(std::move(*m));
+            }
         } catch (const std::exception& e) {
             LOG_WARN("kick", "bad chat event: ", e.what());
         }
