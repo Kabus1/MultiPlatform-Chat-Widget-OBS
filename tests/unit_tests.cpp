@@ -1,6 +1,7 @@
 // Minimal self-contained unit tests (no network): run with `ctest` or directly.
 #include "core/BotFilter.hpp"
 #include "core/EmoteRegistry.hpp"
+#include "core/LanguageTools.hpp"
 #include "core/TtsTextFilter.hpp"
 #include "core/MessagePipeline.hpp"
 #include "core/Settings.hpp"
@@ -271,6 +272,71 @@ void testTtsSkipRules() {
     CHECK(d.tts[0]["text"] == "Sara Gamer:");
 }
 
+void testArabicDetection() {
+    CHECK(lang::isArabicText("هاي"));
+    CHECK(lang::isArabicText("هاي شباب"));
+    CHECK(lang::isArabicText("شلونك"));
+    CHECK(lang::isArabicText("شگد حلو"));       // Iraqi گ is still Arabic
+    CHECK(lang::isArabicText("چا وين رحت"));    // Gulf / Iraqi چ
+    CHECK(lang::isArabicText("هلا والله 😂"));
+    CHECK(lang::isArabicText("هاي bro"));       // mostly Arabic
+    CHECK(lang::isArabicText("مرحبا"));
+    CHECK(!lang::isArabicText("سلام خوبی؟"));   // Persian (Farsi yeh)
+    CHECK(!lang::isArabicText("کجایی"));         // Persian
+    CHECK(!lang::isArabicText("hello there"));
+    CHECK(!lang::isArabicText("good game يا شباب ya all")); // mostly English
+}
+
+void testSlang() {
+    auto r = lang::expandSlang("idk bro");
+    CHECK(r.text == "I don't know, brother" && r.replaced == 2 && r.englishLike);
+    CHECK(lang::expandSlang("gg wp").text == "good game, well played");
+    CHECK(lang::expandSlang("idk bro, gg wp ngl").text == "I don't know, brother, good game, well played, honestly");
+    CHECK(lang::expandSlang("lol").text == "haha");
+    CHECK(lang::expandSlang("LMAO!!").text == "haha!!");
+    CHECK(lang::expandSlang("W stream").text == "win stream");
+    CHECK(lang::expandSlang("tbh u r the best").text == "honestly, you are the best");
+    CHECK(lang::expandSlang("ty u r the goat").text == "thank you, you are the greatest of all time");
+    CHECK(lang::expandSlang("brb, ty").text == "be right back, thank you");
+    // Ambiguous single letters are left alone in non-English text.
+    CHECK(lang::expandSlang("hola y adios").text == "hola y adios");
+    CHECK(lang::expandSlang("wc all", json::array({"wc = welcome"})).text == "welcome all");
+    CHECK(lang::expandSlang("hello everyone").replaced == 0);
+}
+
+void testArabicAndSlangDecisions() {
+    json s = Settings::defaults();
+    s["tts"]["enabled"] = true;
+
+    // Arabic dialect: Google mis-detects as Persian and "translates" -> ignored.
+    auto d = MessagePipeline::decide(sample("هاي"), s, "هاي", true, "مرحبًا", "fa");
+    CHECK(!d.showTranslation);
+    CHECK(d.tts[1]["text"] == "هاي" && d.tts[1]["lang"] == "ar");
+    s["tts"]["mode"] = "translated";
+    d = MessagePipeline::decide(sample("هاي شباب"), s, "هاي شباب", true, "مرحبا يا شباب", "ar");
+    CHECK(d.tts[1]["text"] == "هاي شباب"); // read exactly as written
+    s["translation"]["showForAllLanguages"] = true;
+    d = MessagePipeline::decide(sample("شلونك"), s, "شلونك", true, "كيف حالك", "ku");
+    CHECK(!d.showTranslation && d.tts[1]["text"] == "شلونك");
+    s["translation"]["showForAllLanguages"] = false;
+    s["tts"]["mode"] = "original";
+
+    // Slang: expanded text was translated -> Arabic line is shown.
+    d = MessagePipeline::decide(sample("idk bro"), s, "idk bro", true, "لا أعرف يا أخي", "en", nullptr,
+                                "I don't know brother");
+    CHECK(d.showTranslation);
+    CHECK(d.tts[1]["text"] == "I don't know brother" && d.tts[1]["lang"] == "en");
+    s["tts"]["mode"] = "translated";
+    d = MessagePipeline::decide(sample("idk bro"), s, "idk bro", true, "لا أعرف يا أخي", "en", nullptr,
+                                "I don't know brother");
+    CHECK(d.tts[1]["text"] == "لا أعرف يا أخي" && d.tts[1]["lang"] == "ar"); // same text as the display line
+    s["tts"]["mode"] = "original";
+
+    // Google echoing the input back is never shown as a "translation".
+    d = MessagePipeline::decide(sample("xqc"), s, "xqc", true, "xqc", "en");
+    CHECK(!d.showTranslation);
+}
+
 void testUtil() {
     CHECK(util::utf8Length("سلام") == 4);
     auto parts = util::splitForSpeech(std::string(250, 'a') + " " + std::string(10, 'b'), 180);
@@ -304,6 +370,9 @@ int main() {
     testTtsTextFilter();
     testEmoteRegistry();
     testTtsSkipRules();
+    testArabicDetection();
+    testSlang();
+    testArabicAndSlangDecisions();
     testSettingsSanitize();
     if (failures) {
         std::cerr << failures << " check(s) failed\n";

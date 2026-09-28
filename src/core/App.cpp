@@ -295,6 +295,10 @@ void App::injectTestMessages() {
                           {{T::Text, "What settings are you using for this game? ", ""},
                            {T::Emote, "KEKW", "https://files.kick.com/emotes/37226/fullsize"}},
                           {"moderator"}));
+    // Slang: the Arabic line shows a real translation ("I don't know, brother...").
+    pipeline_.submit(make("twitch", "NightOwl", "#FF7F50", {{T::Text, "idk bro, gg wp ngl", ""}}, {}));
+    // Arabic dialect: shown and read exactly as written, never translated.
+    pipeline_.submit(make("kick", "أبو_فهد", "", {{T::Text, "هاي شباب شلونكم", ""}}, {}));
     // Shown in chat, but never read aloud: contains a link.
     pipeline_.submit(make("kick", "RocketFan99", "#53FC18",
                           {{T::Text, "Clip of that play 🔥 kick.com/rocketfan99/clips", ""}}, {}));

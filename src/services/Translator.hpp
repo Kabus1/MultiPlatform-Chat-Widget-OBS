@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -17,13 +18,18 @@ struct Translation {
 // it uses the public translate.googleapis.com endpoint (no key needed).
 class Translator {
 public:
-    Translation translate(const std::string& text, const std::string& targetLang, const std::string& apiKey);
+    // sourceLang "auto" lets Google detect it; "en" forces English (used for
+    // chat slang Google would otherwise mis-detect).
+    Translation translate(const std::string& text, const std::string& targetLang, const std::string& apiKey,
+                          const std::string& sourceLang = "auto");
 
 private:
-    Translation freeEndpoint(const std::string& text, const std::string& target);
-    Translation cloudV2(const std::string& text, const std::string& target, const std::string& apiKey);
+    Translation freeEndpoint(const std::string& text, const std::string& target, const std::string& source);
+    Translation cloudV2(const std::string& text, const std::string& target, const std::string& apiKey,
+                        const std::string& source);
 
     std::mutex mutex_;
+    int64_t pausedUntilMs_ = 0; // free endpoint rate-limited (HTTP 429): back off
     std::unordered_map<std::string, Translation> cache_;
 };
 

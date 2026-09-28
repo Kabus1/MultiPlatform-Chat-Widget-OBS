@@ -48,6 +48,9 @@ json Settings::defaults() {
             {"targetLang", "ar"},
             {"showForEnglish", true},       // English message -> Arabic line below it
             {"showForAllLanguages", false}, // any language != target gets a line
+            {"preserveArabic", true},       // Arabic (any dialect) is never translated or rewritten
+            {"expandSlang", true},          // "idk" -> "I don't know" before translating
+            {"customSlang", json::array()}, // extra "abbr=expansion" entries
         }},
         {"tts", {
             {"enabled", false},

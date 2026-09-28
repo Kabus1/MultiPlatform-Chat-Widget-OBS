@@ -4,6 +4,7 @@
 #include "core/EmoteRegistry.hpp"
 #include "core/TtsTextFilter.hpp"
 #include "core/EventHub.hpp"
+#include "core/LanguageTools.hpp"
 #include "core/Log.hpp"
 #include "core/Settings.hpp"
 #include "core/Util.hpp"
@@ -144,14 +145,22 @@ bool MessagePipeline::wantsLookup(const ChatMessage& m, const json& s) {
 
 MessagePipeline::Decision MessagePipeline::decide(const ChatMessage& m, const json& s, const std::string& speakText,
                                                   bool translated, const std::string& translation,
-                                                  const std::string& detectedLang, const EmoteRegistry* emotes) {
+                                                  const std::string& detectedLang, const EmoteRegistry* emotes,
+                                                  const std::string& normalizedText) {
     Decision d;
     const json& tr = s["translation"];
     const json& tts = s["tts"];
     const std::string target = tr.value("targetLang", std::string("ar"));
-    const std::string src = primaryLang(detectedLang);
-    const bool foreign = translated && !src.empty() && src != primaryLang(target) &&
-                         util::toLower(util::trim(translation)) != util::toLower(util::trim(speakText));
+    // Arabic (any dialect) is kept exactly as written: never translated,
+    // never replaced by a "standard" rewrite, always spoken with the Arabic voice.
+    const bool arabicText = tr.value("preserveArabic", true) && lang::isArabicText(speakText);
+    const std::string src = arabicText ? std::string("ar") : primaryLang(detectedLang);
+    // What was actually sent to Google (slang expanded), for the echo check.
+    const std::string basis = normalizedText.empty() ? speakText : normalizedText;
+    const std::string trNorm = util::toLower(util::trim(translation));
+    const bool foreign = !arabicText && translated && !src.empty() && src != primaryLang(target) &&
+                         !trNorm.empty() && trNorm != util::toLower(util::trim(basis)) &&
+                         trNorm != util::toLower(util::trim(speakText));
 
     // Display: English message -> translated line right under it.
     if (tr.value("enabled", false) && foreign)
@@ -191,7 +200,14 @@ MessagePipeline::Decision MessagePipeline::decide(const ChatMessage& m, const js
     if (maxChars > 0 && util::utf8Length(original) > static_cast<size_t>(maxChars)) return d;
 
     std::string sayText = original;
-    std::string sayLang = detectedLang.empty() || detectedLang == "auto" ? guessLang(original) : detectedLang;
+    std::string sayLang = arabicText ? std::string("ar")
+                          : detectedLang.empty() || detectedLang == "auto" ? guessLang(original) : detectedLang;
+    // English slang is read in full ("idk" -> "I don't know") in original mode.
+    if (!arabicText && src == "en" && !normalizedText.empty() && normalizedText != speakText) {
+        std::string expanded = TtsTextFilter::clean(
+            tts.value("skipLinks", true) ? TtsTextFilter::stripLinks(normalizedText) : normalizedText, fo);
+        if (!expanded.empty()) sayText = expanded;
+    }
     if (tts.value("mode", std::string("original")) == "translated" && foreign) {
         std::string tr2 = tts.value("skipLinks", true) ? TtsTextFilter::stripLinks(translation) : translation;
         sayText = TtsTextFilter::clean(tr2, fo);
@@ -228,18 +244,40 @@ void MessagePipeline::process(ChatMessage& m, size_t backlog) {
         markThirdPartyEmotes(m, *emotes_);
     }
     std::string text = m.speakableText();
+    const json& tr = s["translation"];
+    const std::string target = tr.value("targetLang", std::string("ar"));
+    const std::string apiKey = s["google"].value("apiKey", std::string());
+
+    // Arabic text is recognised locally and never sent for translation.
+    const bool arabic = tr.value("preserveArabic", true) && lang::isArabicText(text);
+
+    // English slang / abbreviations are expanded before translating, so the
+    // Arabic line shows a real translation instead of the abbreviation echoed back.
+    lang::SlangResult slang;
+    slang.text = text;
+    if (!arabic && tr.value("expandSlang", true) && lang::isLatinOnly(text))
+        slang = lang::expandSlang(text, tr.value("customSlang", json::array()));
 
     bool translated = false;
     Translation t;
     // Under heavy load, skip lookups so the chat never lags behind.
-    if (!text.empty() && wantsLookup(m, s) && backlog < 40) {
-        t = translator_.translate(text, s["translation"].value("targetLang", std::string("ar")),
-                                  s["google"].value("apiKey", std::string()));
+    if (!arabic && !text.empty() && wantsLookup(m, s) && backlog < 40) {
+        const bool forceEnglish = slang.replaced > 0 && slang.englishLike;
+        t = translator_.translate(slang.text, target, apiKey, forceEnglish ? "en" : "auto");
+        // Short slang is often mis-detected (e.g. as Indonesian); retry as English.
+        if (t.ok && !forceEnglish && slang.replaced > 0 && primaryLang(t.detectedLang) != "en" &&
+            primaryLang(t.detectedLang) != primaryLang(target)) {
+            Translation en = translator_.translate(slang.text, target, apiKey, "en");
+            if (en.ok) t = en;
+        }
         translated = t.ok;
     }
-    m.detectedLang = t.detectedLang;
+    m.detectedLang = arabic ? std::string("ar") : t.detectedLang;
+    // Clearly English slang stays English even if the translation call failed.
+    if (m.detectedLang.empty() && slang.replaced > 0 && slang.englishLike) m.detectedLang = "en";
     m.translation = t.text;
-    Decision d = decide(m, s, text, translated, t.text, t.detectedLang, emotes_);
+    Decision d = decide(m, s, text, translated, t.text, m.detectedLang, emotes_,
+                        slang.replaced > 0 ? slang.text : std::string());
     m.showTranslation = d.showTranslation;
     m.tts = d.tts;
 }

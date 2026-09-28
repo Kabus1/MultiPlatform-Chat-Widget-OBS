@@ -40,7 +40,8 @@ public:
     };
     static Decision decide(const ChatMessage& m, const nlohmann::json& settings, const std::string& speakText,
                            bool translated, const std::string& translation, const std::string& detectedLang,
-                           const EmoteRegistry* emotes = nullptr);
+                           const EmoteRegistry* emotes = nullptr,
+                           const std::string& normalizedText = std::string());
     // Turns words that are 7TV / BTTV / FFZ emotes into emote parts.
     static void markThirdPartyEmotes(ChatMessage& m, const EmoteRegistry& emotes);
     static bool wantsLookup(const ChatMessage& m, const nlohmann::json& settings);

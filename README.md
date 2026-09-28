@@ -27,6 +27,14 @@ It also translates messages with Google Translate and reads them aloud with Goog
   - **YouTube:** Google OAuth2 login. The app finds your active live stream on its own.
   - **Kick:** just type your username.
 - **Google Translate.** English messages stay as written, with the translated Arabic line right below them. The target language can be changed.
+  - **Arabic is never translated.** Arabic in any dialect or casual spelling ("هاي", "شلونك", Iraqi/Gulf "شگد", "چا") is shown and read exactly as written, with the Arabic voice.
+    - The app recognizes Arabic from the letters themselves and never sends it to Google. Google's detection often labels short dialect words as Persian or Urdu, which used to cause unwanted "translations".
+    - Real Persian/Urdu spelling (ی ک پ ژ ے) is still translated.
+  - **English slang and abbreviations** (idk, brb, gg, wp, ngl, tbh, ty, lol, W/L, …, about 150 built in, plus your own `abbr = meaning` lines) are expanded before translating. For example, "idk bro, gg wp" becomes "I don't know, brother, good game, well played".
+    - The Arabic line under the message is then a real translation, not the abbreviation echoed back or a failed detection.
+    - The voice uses the same text: the expanded English in *original* mode, or the same Arabic line in *translated* mode.
+    - Short slang is translated as English even when Google's detection guesses another language.
+  - If Google's free endpoint rate-limits (HTTP 429), translation pauses for 60 s instead of retrying non-stop. A Google Cloud API key avoids the limit.
 - **Google TTS** with separate toggles for:
   - reading the username
   - reading the message text

@@ -342,8 +342,9 @@
       const v = get(settings, input.dataset.key);
       if (v === undefined) continue;
       if (input.type === 'checkbox') input.checked = !!v;
-      else if (input.dataset.type === 'list') input.value = (v || []).join('\n');
-      else if (document.activeElement !== input) input.value = v;
+      else if (document.activeElement === input) { /* never overwrite what the user is typing */ }
+      else if (input.dataset.type === 'list' || input.dataset.type === 'lines') input.value = (v || []).join('\n');
+      else input.value = v;
       const out = $(`[data-out="${input.dataset.key}"]`);
       if (out) out.textContent = input.value;
     }
@@ -353,6 +354,7 @@
     if (input.type === 'checkbox') return input.checked;
     if (input.type === 'number' || input.type === 'range') return input.value === '' ? 0 : Number(input.value);
     if (input.dataset.type === 'list') return input.value.split(/[\n,]/).map((s) => s.trim()).filter(Boolean);
+    if (input.dataset.type === 'lines') return input.value.split('\n').map((s) => s.trim()).filter(Boolean);
     return input.value;
   }
 
