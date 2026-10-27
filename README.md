@@ -158,7 +158,10 @@ How it connects:
    - a lookup on `kick.com/api/v2/channels/<name>`, then `/chatroom`, then `/api/v1/channels/<name>`
 
    A successful lookup is saved, so it only has to succeed once.
-2. **Pusher WebSocket.** It connects to `wss://ws-us2.pusher.com/app/<key>` with `Origin: https://kick.com` and subscribes to `chatrooms.<id>.v2` and `chatroom_<id>`.
+2. **Pusher WebSocket.** It connects to `wss://ws-<cluster>.pusher.com/app/<key>` with `Origin: https://kick.com` and subscribes to `chatrooms.<id>.v2` and `chatroom_<id>`.
+   - **The key rotates.** Kick retired `32cbd69e4b950bf97679` in October 2026. The current key (`34bf7a0ff419a2a775b9`, `us2`) is now fetched from Kick each time the app connects, via `POST web.kick.com/api/v1/realtime/connection` with `accepted_providers: [pusher]`.
+   - If Pusher still answers 4001 ("app key not in this cluster"), the app fetches the key again and retries automatically.
+   - Old keys in existing settings files are replaced on startup.
 3. **Connected.** The status turns *connected* only when Kick confirms the subscription. If that doesn't happen within 15 s, the app shows an error and reconnects.
 
 Pusher error codes 4000–4099 (wrong key, app disabled, origin rejected) are shown as errors and retried after 60 s, instead of looping on "connecting".

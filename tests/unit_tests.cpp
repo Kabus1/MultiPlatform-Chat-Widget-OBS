@@ -398,6 +398,18 @@ void testKickLookup() {
     CHECK(m && m->id == "123" && m->userId == "7");
 
     CHECK(KickClient::describePusherCode(4001, "").find("key") != std::string::npos);
+
+    // Current Pusher key from web.kick.com/api/v1/realtime/connection.
+    auto p = KickClient::parseRealtimeConfig(
+        R"({"data":{"connections":[{"provider":"centrifugo","credentials":{"url":"wss://x"}},)"
+        R"({"provider":"pusher","credentials":{"app_key":"34bf7a0ff419a2a775b9","cluster":"us2"}}]}})");
+    CHECK(p && p->key == "34bf7a0ff419a2a775b9" && p->cluster == "us2");
+    CHECK(!KickClient::parseRealtimeConfig(R"({"data":{"connections":[]}})"));
+    CHECK(!KickClient::parseRealtimeConfig("<html>Just a moment...</html>"));
+    CHECK(!KickClient::parseRealtimeConfig(
+        R"({"data":{"connections":[{"provider":"pusher","credentials":{"app_key":"bad key!","cluster":"us2"}}]}})"));
+    CHECK(KickClient::isRetiredPusherKey("32cbd69e4b950bf97679"));
+    CHECK(!KickClient::isRetiredPusherKey(KickClient::kDefaultPusherKey));
 }
 
 std::string gzipForTest(const std::string& in) {

@@ -67,6 +67,18 @@ public:
     // Human-readable meaning of a Pusher error / close code.
     static std::string describePusherCode(int code, const std::string& message);
 
+    // Kick's current public Pusher app (it rotates: 32cbd69e... was retired in
+    // Oct 2026). Kick publishes it at web.kick.com/api/v1/realtime/connection.
+    struct PusherConfig {
+        std::string key;
+        std::string cluster;
+    };
+    static constexpr const char* kDefaultPusherKey = "34bf7a0ff419a2a775b9";
+    static constexpr const char* kDefaultPusherCluster = "us2";
+    static bool isRetiredPusherKey(const std::string& key);
+    // Parses {"data":{"connections":[{"provider":"pusher","credentials":{"app_key","cluster"}}]}}.
+    static std::optional<PusherConfig> parseRealtimeConfig(const std::string& body);
+
 private:
     void run();
     LookupResult lookup(const std::string& slug);
@@ -74,6 +86,9 @@ private:
     void onPusherClose(int code, const std::string& reason, WebSocketClient& ws);
     bool seen(const std::string& id);
     bool sleepFor(int ms);
+    std::optional<PusherConfig> fetchPusherConfig();
+    // Builds the socket URL; refreshes the key from Kick first when asked to.
+    std::string pusherUrl();
 
     Config cfg_;
     MessageSink onMessage_;
@@ -90,6 +105,13 @@ private:
     std::atomic<bool> subscribed_{false};
     std::atomic<int64_t> establishedAtMs_{0};
     std::atomic<bool> fatalError_{false}; // keep the error visible across reconnects
+
+    std::mutex pusherMutex_;
+    PusherConfig pusher_;                  // key / cluster in use
+    std::atomic<bool> refreshPusherKey_{false};
+    std::atomic<int> keyRefreshes_{0};     // consecutive 4001 rejections
+    std::atomic<bool> keyErrorPending_{false};
+    std::string lastKeyError_;
 
     std::mutex seenMutex_;
     std::unordered_set<std::string> seenIds_;

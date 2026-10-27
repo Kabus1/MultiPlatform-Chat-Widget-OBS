@@ -141,7 +141,7 @@ KickClient::LookupResult KickClient::lookup(const std::string& slug) {
 std::string KickClient::describePusherCode(int code, const std::string& message) {
     std::string m = message.empty() ? "" : " - " + message;
     switch (code) {
-    case 4001: return "Pusher app key not found or wrong cluster" + m + ". Kick may have changed its key: update it in Kick > Troubleshooting.";
+    case 4001: return "Kick rejected the chat key even after fetching a new one" + m + ". Retrying every minute.";
     case 4003: return "Kick's Pusher app is disabled" + m;
     case 4004: return "Kick's Pusher app is over its connection quota" + m;
     case 4005: return "Pusher path not found" + m;
@@ -216,9 +216,23 @@ void KickClient::run() {
     WebSocketClient::Options opt;
     // Same handshake as the kick.com web client.
     opt.headers = {{"Origin", "https://kick.com"}, {"User-Agent", http::browserUserAgent()}};
-    auto ws = std::make_unique<WebSocketClient>("wss://ws-" + cfg_.pusherCluster + ".pusher.com/app/" + cfg_.pusherKey +
-                                                    "?protocol=7&client=js&version=8.4.0&flash=false",
-                                                std::move(cb), std::move(opt));
+    // Kick's chat key rotates: ask Kick for the current one first; fall back to
+    // the configured key (unless it is a retired one) or the built-in default.
+    {
+        PusherConfig chosen;
+        if (auto live = fetchPusherConfig()) {
+            chosen = *live;
+        } else {
+            std::string key = util::trim(cfg_.pusherKey);
+            chosen.key = key.empty() || isRetiredPusherKey(key) ? kDefaultPusherKey : key;
+            chosen.cluster = util::trim(cfg_.pusherCluster).empty() ? kDefaultPusherCluster : util::trim(cfg_.pusherCluster);
+        }
+        std::lock_guard<std::mutex> lock(pusherMutex_);
+        pusher_ = chosen;
+    }
+    // Each reconnect rebuilds the URL, re-fetching the key after a 4001.
+    opt.urlProvider = [this] { return pusherUrl(); };
+    auto ws = std::make_unique<WebSocketClient>(pusherUrl(), std::move(cb), std::move(opt));
     *socket = ws.get();
     onStatus_("connecting", "Connecting to Kick chat (chatroom " + chatroomId_ + ")");
     {
@@ -241,16 +255,84 @@ void KickClient::run() {
     }
 }
 
+bool KickClient::isRetiredPusherKey(const std::string& key) {
+    return key == "32cbd69e4b950bf97679" || key == "eb1d5f283081a78b932c";
+}
+
+std::optional<KickClient::PusherConfig> KickClient::parseRealtimeConfig(const std::string& body) {
+    json j = json::parse(body, nullptr, false);
+    if (j.is_discarded() || !j.is_object() || !j.contains("data") || !j["data"].is_object()) return std::nullopt;
+    const json& conns = j["data"].value("connections", json::array());
+    static const std::regex keyRe(R"(^[A-Za-z0-9]{8,64}$)");
+    static const std::regex clusterRe(R"(^[a-z0-9-]{2,20}$)");
+    for (const auto& c : conns) {
+        if (!c.is_object() || c.value("provider", std::string()) != "pusher") continue;
+        const json cred = c.value("credentials", json::object());
+        if (!cred.is_object()) continue;
+        PusherConfig p;
+        p.key = cred.value("app_key", std::string());
+        p.cluster = cred.value("cluster", std::string());
+        if (std::regex_match(p.key, keyRe) && std::regex_match(p.cluster, clusterRe)) return p;
+    }
+    return std::nullopt;
+}
+
+std::optional<KickClient::PusherConfig> KickClient::fetchPusherConfig() {
+    // Kick's web client negotiates its realtime transport here; asking for
+    // Pusher only returns the current public Pusher app key. No login needed.
+    json body = {{"client", {{"id", util::randomToken(16)}, {"type", "web"}}},
+                 {"capabilities", {{"accepted_providers", json::array({{{"provider", "pusher"}}})}}}};
+    auto r = http::postJson("https://web.kick.com/api/v1/realtime/connection", body.dump(),
+                            {{"Accept", "application/json"}, {"Origin", "https://kick.com"}, {"Referer", "https://kick.com/"}},
+                            10);
+    auto cfg = r.ok() ? parseRealtimeConfig(r.body) : std::nullopt;
+    if (cfg)
+        LOG_INFO("kick", "chat key from Kick: ", cfg->key, " (", cfg->cluster, ")");
+    else
+        LOG_WARN("kick", "could not get the current chat key from Kick (",
+                 r.status == 0 ? r.error : "HTTP " + std::to_string(r.status), "), using the built-in one");
+    return cfg;
+}
+
+std::string KickClient::pusherUrl() {
+    if (refreshPusherKey_.exchange(false)) {
+        auto live = fetchPusherConfig();
+        std::lock_guard<std::mutex> lock(pusherMutex_);
+        if (live && live->key != pusher_.key) {
+            pusher_ = *live;
+        } else if (pusher_.key != kDefaultPusherKey) {
+            // Kick did not answer (or returned the rejected key): try the built-in one.
+            pusher_ = {kDefaultPusherKey, kDefaultPusherCluster};
+        }
+    }
+    std::lock_guard<std::mutex> lock(pusherMutex_);
+    return "wss://ws-" + pusher_.cluster + ".pusher.com/app/" + pusher_.key +
+           "?protocol=7&client=js&version=8.4.0&flash=false";
+}
+
 void KickClient::onPusherClose(int code, const std::string& reason, WebSocketClient& ws) {
     subscribed_ = false;
     establishedAtMs_ = 0;
     if (!running_) return;
     LOG_WARN("kick", "chat socket closed: code ", code, reason.empty() ? "" : " (" + reason + ")");
+    // 4001 = app key unknown: Kick rotated its key. Fetch the new one and retry
+    // right away, a couple of times, before reporting it as a hard error.
+    const bool keyRejected = keyErrorPending_.exchange(false) || code == 4001;
+    if (keyRejected) {
+        if (keyRefreshes_++ < 2) {
+            refreshPusherKey_ = true;
+            ws.setNextRetryDelay(1000);
+            onStatus_("connecting", "Kick changed its chat key - getting the new one...");
+            return;
+        }
+        code = 4001; // still rejected after refreshing: report it below
+    }
     // Pusher protocol: 4000-4099 = don't retry the same way, 4100-4199 = retry
     // after a pause, 4200-4299 = retry now. Keep fatal errors on screen.
     if (code >= 4000 && code <= 4099) {
         fatalError_ = true;
-        onStatus_("error", describePusherCode(code, reason));
+        refreshPusherKey_ = keyRejected; // keep asking Kick for a new key on each retry
+        onStatus_("error", describePusherCode(code, reason.empty() && keyRejected ? lastKeyError_ : reason));
         ws.setNextRetryDelay(60000);
         return;
     }
@@ -295,6 +377,7 @@ void KickClient::onText(const std::string& payload, WebSocketClient& ws) {
     } else if (event == "pusher_internal:subscription_succeeded") {
         if (!subscribed_.exchange(true)) {
             fatalError_ = false;
+            keyRefreshes_ = 0;
             onStatus_("connected", (util::trim(cfg_.username).empty() ? std::string("chatroom ") : cfg_.username + " - chatroom ") +
                                        chatroomId_);
         }
@@ -305,6 +388,12 @@ void KickClient::onText(const std::string& payload, WebSocketClient& ws) {
         int code = d.is_object() ? d.value("code", 0) : 0;
         std::string msg = d.is_object() ? d.value("message", std::string()) : d.dump();
         LOG_WARN("kick", "pusher error ", code, ": ", msg);
+        if (code == 4001) {
+            // Rotated key: handled when the socket closes (fetch new key, retry).
+            keyErrorPending_ = true;
+            lastKeyError_ = msg;
+            return;
+        }
         if (code >= 4000 && code <= 4099) fatalError_ = true;
         onStatus_("error", describePusherCode(code, msg));
     } else if (event == "pusher:subscription_error" || event == "pusher_internal:subscription_error") {

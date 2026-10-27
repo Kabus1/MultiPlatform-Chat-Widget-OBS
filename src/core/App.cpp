@@ -37,6 +37,10 @@ App::App(const std::string& configDir, int portOverride)
     settings_.load();
     tokens_.load();
     port_ = portOverride > 0 ? portOverride : settings_.snapshot()["server"].value("port", 8787);
+    // Kick retired its old Pusher key: replace it in existing settings files.
+    if (KickClient::isRetiredPusherKey(settings_.snapshot()["kick"].value("pusherKey", "")))
+        settings_.applyPatch({{"kick", {{"pusherKey", KickClient::kDefaultPusherKey},
+                                        {"pusherCluster", KickClient::kDefaultPusherCluster}}}});
     settings_.save(); // writes defaults on first run so users can find the file
     for (const char* p : kPlatforms) status_[p] = {{"state", "disabled"}, {"detail", ""}};
 }

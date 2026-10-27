@@ -33,7 +33,8 @@ json Settings::defaults() {
             {"enabled", false},
             {"username", ""},
             {"chatroomId", ""}, // optional manual override if Kick's API is blocked
-            {"pusherKey", "32cbd69e4b950bf97679"},
+            // Fallback only: the current key is fetched from Kick on connect.
+            {"pusherKey", "34bf7a0ff419a2a775b9"},
             {"pusherCluster", "us2"},
             // Cached result of the (Cloudflare-protected) username lookup, so
             // it only has to succeed once. Cleared by "Re-detect".
