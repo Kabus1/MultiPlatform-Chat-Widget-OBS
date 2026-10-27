@@ -60,7 +60,7 @@ void TwitchClient::start() {
     WebSocketClient::Callbacks cb;
     cb.onOpen = [this] { onOpen(); };
     cb.onMessage = [this](const std::string& text) { onText(text); };
-    cb.onClose = [this] {
+    cb.onClose = [this](int, const std::string&) {
         if (running_) onStatus_("connecting", "Disconnected, reconnecting...");
     };
     cb.onError = [this](const std::string& reason) { onStatus_("error", "Connection error: " + reason); };

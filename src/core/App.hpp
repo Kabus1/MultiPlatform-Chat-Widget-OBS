@@ -54,6 +54,11 @@ public:
     void injectTestMessages();
     void clearChat();
 
+    // Kick: chatroom id from text the user pasted (from the kickLookup page,
+    // or just the number), and forgetting the cached id ("Re-detect").
+    nlohmann::json kickResolveFromText(const std::string& text);
+    void kickForgetChatroom();
+
 private:
     std::optional<TokenSet> validToken(const std::string& platform, bool forceRefresh);
     std::optional<oauth::Provider> provider(const std::string& platform, std::string& error);

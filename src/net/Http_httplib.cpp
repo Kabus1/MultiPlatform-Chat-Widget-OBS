@@ -81,6 +81,7 @@ Response convert(const httplib::Result& r) {
     out.status = r->status;
     out.body = r->body;
     out.contentType = r->get_header_value("Content-Type");
+    for (const auto& [k, v] : r->headers) out.headers.emplace_back(k, v);
     return out;
 }
 

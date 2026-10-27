@@ -86,13 +86,39 @@
         <div class="card-head"><span class="logo" data-logo="kick"></span><h3>Kick</h3>
           <span class="pill" data-status="kick">disabled</span>
           <label class="switch"><input type="checkbox" data-key="kick.enabled"><span></span></label></div>
+        <p class="account" data-account="kick"></p>
         <label>Kick username<input type="text" data-key="kick.username" placeholder="your channel name" spellcheck="false"></label>
-        <div class="btn-row"><button data-reconnect="kick">Reconnect</button></div>
+        <div class="btn-row">
+          <button data-reconnect="kick">Reconnect</button>
+          <button id="kick-find">Find chatroom ID</button>
+          <button id="kick-forget" title="Forget the saved chatroom ID and look it up again">Re-detect</button>
+        </div>
+        <div id="kick-assist" class="assist" hidden>
+          <p class="hint"><b>1.</b> A Kick page opened in your browser. Wait until it shows text (it starts with <code>{"id":</code>).<br>
+            <b>2.</b> Select everything on it (Ctrl+A), copy (Ctrl+C) and paste below. Pasting just the chatroom number also works.</p>
+          <textarea id="kick-paste" rows="3" placeholder='{"id":123,"slug":"...","chatroom":{"id":456789,...}}'></textarea>
+          <div class="btn-row"><button id="kick-apply" class="primary">Use this</button><span id="kick-assist-result" class="hint"></span></div>
+        </div>
         <details>
           <summary>Troubleshooting</summary>
-          <label>Chatroom ID <small>(only if the lookup is blocked)</small><input type="text" data-key="kick.chatroomId" placeholder="auto"></label>
+          <label>Chatroom ID override <small>(normally found automatically and remembered)</small><input type="text" data-key="kick.chatroomId" placeholder="auto"></label>
           <label>Pusher key<input type="text" data-key="kick.pusherKey" spellcheck="false"></label>
           <label>Pusher cluster<input type="text" data-key="kick.pusherCluster" spellcheck="false"></label>
+        </details>
+      </div>
+
+      <div class="card platform-card" data-platform="tiktok">
+        <div class="card-head"><span class="logo" data-logo="tiktok"></span><h3>TikTok LIVE</h3>
+          <span class="pill" data-status="tiktok">disabled</span>
+          <label class="switch"><input type="checkbox" data-key="tiktok.enabled"><span></span></label></div>
+        <p class="account" data-account="tiktok"></p>
+        <label>TikTok username<input type="text" data-key="tiktok.username" placeholder="@yourname" spellcheck="false"></label>
+        <div class="btn-row"><button data-reconnect="tiktok">Reconnect</button></div>
+        <details>
+          <summary>Signing server</summary>
+          <p class="hint">TikTok has no public LIVE-chat API. Reading chat needs signed requests, done by a signing server. Euler Stream offers a free API key at eulerstream.com.</p>
+          <label>API key<input type="password" data-key="tiktok.apiKey" autocomplete="off"></label>
+          <label>Signing server URL<input type="text" data-key="tiktok.signServer" spellcheck="false"></label>
         </details>
       </div>
       <p class="status-line" data-detail></p>
@@ -121,6 +147,7 @@
           <label><span class="logo" data-logo="twitch"></span>Twitch<input type="color" data-key="ui.colors.twitch"></label>
           <label><span class="logo" data-logo="youtube"></span>YouTube<input type="color" data-key="ui.colors.youtube"></label>
           <label><span class="logo" data-logo="kick"></span>Kick<input type="color" data-key="ui.colors.kick"></label>
+          <label><span class="logo" data-logo="tiktok"></span>TikTok<input type="color" data-key="ui.colors.tiktok"></label>
         </div>
       </div>
       <div class="card">
@@ -205,6 +232,7 @@
           <label class="check"><input type="checkbox" data-key="tts.platforms.twitch"> Twitch</label>
           <label class="check"><input type="checkbox" data-key="tts.platforms.youtube"> YouTube</label>
           <label class="check"><input type="checkbox" data-key="tts.platforms.kick"> Kick</label>
+          <label class="check"><input type="checkbox" data-key="tts.platforms.tiktok"> TikTok</label>
         </div>
         <label>Don't read these users <small>(one per line; bots are removed by the bot filter)</small><textarea rows="3" data-key="tts.ignoredUsers" data-type="list"></textarea></label>
       </div>

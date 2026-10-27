@@ -247,6 +247,20 @@ void WebServer::routes() {
         sendJson(res, {{"ok", true}});
     });
 
+    // --- Kick chatroom lookup assist ----------------------------------------
+    // Body: {"text": "<page content or the number>"}.
+    s.Post("/api/kick/resolve", [this](const httplib::Request& req, httplib::Response& res) {
+        json body = json::parse(req.body, nullptr, false);
+        if (body.is_discarded() || !body.is_object() || !body.contains("text") || !body["text"].is_string())
+            return sendJson(res, {{"ok", false}, {"error", "expected {\"text\": \"...\"}"}}, 400);
+        json r = app_.kickResolveFromText(body["text"].get<std::string>());
+        sendJson(res, r, r.value("ok", false) ? 200 : 422);
+    });
+    s.Post("/api/kick/forget", [this](const httplib::Request&, httplib::Response& res) {
+        app_.kickForgetChatroom();
+        sendJson(res, {{"ok", true}});
+    });
+
     s.Post("/api/reconnect", [this](const httplib::Request& req, httplib::Response& res) {
         app_.reconnect(req.get_param_value("platform"));
         sendJson(res, {{"ok", true}});

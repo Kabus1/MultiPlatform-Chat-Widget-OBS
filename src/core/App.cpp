@@ -4,6 +4,7 @@
 #include "core/Util.hpp"
 #include "net/Http.hpp"
 #include "platforms/KickClient.hpp"
+#include "platforms/TikTokClient.hpp"
 #include "platforms/TwitchClient.hpp"
 #include "platforms/YouTubeClient.hpp"
 
@@ -14,8 +15,17 @@ namespace usc {
 using nlohmann::json;
 
 namespace {
-const char* kPlatforms[] = {"twitch", "youtube", "kick"};
+const char* kPlatforms[] = {"twitch", "youtube", "kick", "tiktok"};
+
+// Connection-relevant part of a platform's settings: cached lookup results
+// (kick.resolved*) are written by the client itself and must not trigger a
+// reconnect.
+json connectionConfig(json cfg) {
+    if (cfg.is_object())
+        for (const char* k : {"resolvedSlug", "resolvedChatroomId", "resolvedUserId"}) cfg.erase(k);
+    return cfg;
 }
+} // namespace
 
 App::App(const std::string& configDir, int portOverride)
     : settings_((std::filesystem::path(configDir) / "settings.json").string()),
@@ -197,6 +207,12 @@ json App::status() {
         platforms[p]["account"] = t ? t->login : "";
         platforms[p]["redirectUri"] = redirectUri(p);
     }
+    json kick = settings_.snapshot()["kick"];
+    platforms["kick"]["chatroomId"] = !kick.value("chatroomId", "").empty() ? kick.value("chatroomId", "")
+                                                                            : kick.value("resolvedChatroomId", "");
+    platforms["kick"]["chatroomSource"] = !kick.value("chatroomId", "").empty()           ? "manual"
+                                          : !kick.value("resolvedChatroomId", "").empty() ? "cached"
+                                                                                           : "";
     return {{"version", APP_VERSION},
             {"port", port_},
             {"platforms", platforms},
@@ -223,7 +239,7 @@ json App::applySettings(const json& patch) {
         bool changed;
         {
             std::lock_guard<std::mutex> lock(clientsMutex_);
-            changed = platformConfig_[p] != s[p];
+            changed = platformConfig_[p] != connectionConfig(s[p]);
         }
         if (changed) restartPlatform(p);
     }
@@ -244,7 +260,7 @@ void App::restartPlatform(const std::string& platform) {
     }
     json s = settings_.snapshot();
     const json& cfg = s[platform];
-    platformConfig_[platform] = cfg;
+    platformConfig_[platform] = connectionConfig(cfg);
     if (!cfg.value("enabled", false)) {
         setStatus(platform, "disabled", "");
         return;
@@ -262,14 +278,48 @@ void App::restartPlatform(const std::string& platform) {
             YouTubeClient::Config{cfg.value("videoId", ""), std::max(2000, cfg.value("minPollMs", 6000)),
                                   cfg.value("showBacklog", true), tokens},
             sink, status);
+    } else if (platform == "kick") {
+        KickClient::Config kc;
+        kc.username = cfg.value("username", "");
+        kc.chatroomId = cfg.value("chatroomId", "");
+        kc.pusherKey = cfg.value("pusherKey", "");
+        kc.pusherCluster = cfg.value("pusherCluster", "us2");
+        kc.cachedSlug = cfg.value("resolvedSlug", "");
+        kc.cachedChatroomId = cfg.value("resolvedChatroomId", "");
+        kc.cachedUserId = cfg.value("resolvedUserId", "");
+        // Runs on the Kick worker thread: persist only, never restart from here.
+        kc.onResolved = [this](const std::string& slug, const std::string& chatroom, const std::string& user) {
+            json s = settings_.applyPatch(
+                {{"kick", {{"resolvedSlug", slug}, {"resolvedChatroomId", chatroom}, {"resolvedUserId", user}}}});
+            hub_.publish("settings", s);
+        };
+        client = std::make_unique<KickClient>(std::move(kc), sink, status);
     } else {
-        client = std::make_unique<KickClient>(
-            KickClient::Config{cfg.value("username", ""), cfg.value("chatroomId", ""),
-                               cfg.value("pusherKey", ""), cfg.value("pusherCluster", "us2")},
+        client = std::make_unique<TikTokClient>(
+            TikTokClient::Config{cfg.value("username", ""), cfg.value("signServer", ""), cfg.value("apiKey", "")},
             sink, status);
     }
     client->start();
     clients_[platform] = std::move(client);
+}
+
+json App::kickResolveFromText(const std::string& text) {
+    std::string slug = KickClient::normalizeSlug(settings_.snapshot()["kick"].value("username", ""));
+    if (slug.empty()) return {{"ok", false}, {"error", "Enter the Kick username first"}};
+    auto r = KickClient::parseLookupResponse(200, text);
+    if (r.chatroomId.empty())
+        return {{"ok", false},
+                {"error", r.blocked ? "That is Cloudflare's check page, not the channel data. Wait for the page to finish "
+                                      "loading, then copy everything again."
+                                    : "No chatroom ID found in the pasted text."}};
+    applySettings({{"kick", {{"resolvedSlug", slug}, {"resolvedChatroomId", r.chatroomId}, {"resolvedUserId", r.userId}}}});
+    restartPlatform("kick");
+    return {{"ok", true}, {"chatroomId", r.chatroomId}};
+}
+
+void App::kickForgetChatroom() {
+    applySettings({{"kick", {{"resolvedSlug", ""}, {"resolvedChatroomId", ""}, {"resolvedUserId", ""}}}});
+    restartPlatform("kick");
 }
 
 void App::injectTestMessages() {
@@ -309,12 +359,17 @@ void App::injectTestMessages() {
 
 json App::links() const {
     std::string base = "http://localhost:" + std::to_string(port_);
-    return {
+    json links = {
         {"dock", base + "/"},
         {"overlay", base + "/overlay"},
         {"overlayVoice", base + "/overlay?tts=1"},
         {"window", base + "/?app=1"},
     };
+    // Kick channel data, opened in the user's own browser (passes Cloudflare)
+    // for the one-time manual chatroom lookup.
+    std::string slug = KickClient::normalizeSlug(settings_.snapshot()["kick"].value("username", ""));
+    if (!slug.empty()) links["kickLookup"] = "https://kick.com/api/v2/channels/" + util::urlEncode(slug);
+    return links;
 }
 
 void App::testVoice() {

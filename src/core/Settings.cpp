@@ -35,6 +35,19 @@ json Settings::defaults() {
             {"chatroomId", ""}, // optional manual override if Kick's API is blocked
             {"pusherKey", "32cbd69e4b950bf97679"},
             {"pusherCluster", "us2"},
+            // Cached result of the (Cloudflare-protected) username lookup, so
+            // it only has to succeed once. Cleared by "Re-detect".
+            {"resolvedSlug", ""},
+            {"resolvedChatroomId", ""},
+            {"resolvedUserId", ""},
+        }},
+        {"tiktok", {
+            {"enabled", false},
+            {"username", ""},
+            // TikTok's webcast protocol needs signed requests; a signing
+            // server does that (Euler Stream has a free tier with an API key).
+            {"signServer", "https://tiktok.eulerstream.com"},
+            {"apiKey", ""},
         }},
         {"google", {
             // Optional. Empty = Google's free public Translate / TTS endpoints.
@@ -69,7 +82,7 @@ json Settings::defaults() {
             {"volume", 1.0},
             {"rate", 1.0},
             {"maxQueue", 10},
-            {"platforms", {{"twitch", true}, {"youtube", true}, {"kick", true}}},
+            {"platforms", {{"twitch", true}, {"youtube", true}, {"kick", true}, {"tiktok", true}}},
             {"ignoredUsers", json::array()}, // real users who should not be read aloud
         }},
         {"audio", {
@@ -114,7 +127,7 @@ json Settings::defaults() {
             {"thirdPartyEmotes", true}, // 7TV / BTTV / FFZ emotes shown as images
             {"maxMessages", 150},
             {"animate", true},
-            {"colors", {{"twitch", "#9146FF"}, {"youtube", "#FF0033"}, {"kick", "#53FC18"}}},
+            {"colors", {{"twitch", "#9146FF"}, {"youtube", "#FF0033"}, {"kick", "#53FC18"}, {"tiktok", "#FE2C55"}}},
         }},
     };
 }

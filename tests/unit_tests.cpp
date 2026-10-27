@@ -6,7 +6,11 @@
 #include "core/MessagePipeline.hpp"
 #include "core/Settings.hpp"
 #include "core/Util.hpp"
+#include "net/Protobuf.hpp"
 #include "platforms/KickClient.hpp"
+#include "platforms/TikTokClient.hpp"
+
+#include <miniz.h>
 #include "platforms/TwitchClient.hpp"
 #include "platforms/YouTubeClient.hpp"
 
@@ -360,6 +364,118 @@ void testSettingsSanitize() {
 }
 } // namespace
 
+void testKickLookup() {
+    CHECK(KickClient::normalizeSlug("https://kick.com/QFazek?tab=chat") == "qfazek");
+    CHECK(KickClient::normalizeSlug(" @QFazek ") == "qfazek");
+    CHECK(KickClient::normalizeSlug("qfazek") == "qfazek");
+
+    // /api/v2/channels/{slug}
+    auto r = KickClient::parseLookupResponse(200, R"({"id":1,"user_id":55,"slug":"qfazek","chatroom":{"id":999,"chatable_id":1}})");
+    CHECK(r.chatroomId == "999" && r.userId == "55");
+    // /api/v2/channels/{slug}/chatroom
+    r = KickClient::parseLookupResponse(200, R"({"id":777,"chatable_type":"App\\Models\\Channel","chatable_id":1,"slow_mode":false})");
+    CHECK(r.chatroomId == "777");
+    // Cloudflare challenge page.
+    r = KickClient::parseLookupResponse(403, "<!DOCTYPE html><title>Just a moment...</title>");
+    CHECK(r.blocked && r.chatroomId.empty());
+    r = KickClient::parseLookupResponse(200, "<html><script>window._cf_chl_opt={}</script>");
+    CHECK(r.blocked);
+    r = KickClient::parseLookupResponse(404, "{}");
+    CHECK(r.notFound);
+    // Things a user may paste.
+    CHECK(KickClient::parseLookupResponse(200, "  4567890 \n").chatroomId == "4567890");
+    r = KickClient::parseLookupResponse(200, "Raw Data Headers\n{\"id\":1,\"user_id\":9,\"chatroom\":{\"id\":321,\"slow_mode\":false}} Pretty-print");
+    CHECK(r.chatroomId == "321" && r.userId == "9");
+
+    // Legacy ChatMessageSentEvent shape.
+    json legacy = {{"message", {{"id", "abc"}, {"message", "hello [emote:1:Wave]"}}},
+                   {"user", {{"id", 5}, {"username", "Viewer"}, {"identity", {{"color", "#FF0000"}}}}}};
+    auto m = KickClient::parseChatEvent(legacy);
+    CHECK(m && m->displayName == "Viewer" && m->id == "abc" && m->parts.size() == 2 && m->userColor == "#FF0000");
+    // Numeric ids are accepted too.
+    json v2 = {{"id", 123}, {"content", "hi"}, {"sender", {{"id", 7}, {"username", "A"}, {"slug", "a"}}}};
+    m = KickClient::parseChatEvent(v2);
+    CHECK(m && m->id == "123" && m->userId == "7");
+
+    CHECK(KickClient::describePusherCode(4001, "").find("key") != std::string::npos);
+}
+
+std::string gzipForTest(const std::string& in) {
+    size_t len = 0;
+    void* raw = tdefl_compress_mem_to_heap(in.data(), in.size(), &len, TDEFL_DEFAULT_MAX_PROBES);
+    std::string out("\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xff", 10);
+    out.append(static_cast<const char*>(raw), len);
+    mz_free(raw);
+    auto le32 = [&](uint32_t v) {
+        for (int i = 0; i < 4; ++i) out.push_back(static_cast<char>((v >> (8 * i)) & 0xFF));
+    };
+    le32(static_cast<uint32_t>(mz_crc32(MZ_CRC32_INIT, reinterpret_cast<const unsigned char*>(in.data()), in.size())));
+    le32(static_cast<uint32_t>(in.size()));
+    return out;
+}
+
+void testTikTokProtocol() {
+    // Push frame round trip.
+    TikTokClient::PushFrame f;
+    f.logId = 123456789;
+    f.payloadEncoding = "pb";
+    f.payloadType = "msg";
+    f.payload = std::string("\x00\x01\x02", 3);
+    f.headers["compress_type"] = "gzip";
+    auto back = TikTokClient::parsePushFrame(TikTokClient::encodePushFrame(f));
+    CHECK(back && back->logId == 123456789 && back->payloadType == "msg" && back->payload == f.payload &&
+          back->headers["compress_type"] == "gzip");
+
+    // A chat message, as TikTok sends it: frame -> gzip -> fetch result -> chat.
+    std::string user = pb::Writer().varint(1, 42).bytes(3, "Nick Name").bytes(38, "nick_1").str();
+    std::string common = pb::Writer().varint(2, 777).str();
+    std::string chat = pb::Writer().bytes(1, common).bytes(2, user).bytes(3, "مرحبا from TikTok").str();
+    std::string base = pb::Writer().bytes(1, "WebcastChatMessage").bytes(2, chat).str();
+    std::string control = pb::Writer().bytes(1, "WebcastControlMessage").bytes(2, pb::Writer().varint(2, 3).str()).str();
+    std::string route = pb::Writer().bytes(1, "wrss").bytes(2, "xyz").str();
+    std::string result = pb::Writer()
+                             .bytes(1, base)
+                             .bytes(1, control)
+                             .bytes(2, "cursor-1")
+                             .bytes(5, "ext-1")
+                             .bytes(7, route)
+                             .varint(9, 1)
+                             .bytes(10, "wss://push.example/ws")
+                             .str();
+    std::string gz = gzipForTest(result);
+    std::string inflated;
+    CHECK(TikTokClient::gunzip(gz, inflated) && inflated == result);
+    CHECK(!TikTokClient::gunzip("not gzip at all......", inflated));
+
+    auto res = TikTokClient::parseFetchResult(inflated);
+    CHECK(res && res->messages.size() == 2 && res->cursor == "cursor-1" && res->internalExt == "ext-1" &&
+          res->needsAck && res->routeParams["wrss"] == "xyz" && res->pushServer == "wss://push.example/ws");
+    auto m = TikTokClient::parseChatMessage(res->messages[0].second);
+    CHECK(m && m->platform == "tiktok" && m->username == "nick_1" && m->displayName == "Nick Name" &&
+          m->userId == "42" && m->id == "tt-777" && m->plainText() == "مرحبا from TikTok");
+    CHECK(TikTokClient::isStreamEnd(res->messages[1].second));
+    CHECK(!TikTokClient::parseChatMessage(pb::Writer().bytes(2, user).str())); // no text
+
+    // Malformed input never crashes.
+    CHECK(!TikTokClient::parsePushFrame(std::string("\xff\xff\xff", 3)));
+
+    // Heartbeat / enter-room frames are valid push frames.
+    auto hb = TikTokClient::parsePushFrame(TikTokClient::heartbeatFrame("7300000000000000001"));
+    CHECK(hb && hb->payloadType == "hb" && hb->payloadEncoding == "pb");
+    auto enter = TikTokClient::parsePushFrame(TikTokClient::enterRoomFrame("7300000000000000001"));
+    CHECK(enter && enter->payloadType == "im_enter_room");
+
+    // Room lookup responses.
+    auto room = TikTokClient::parseRoomInfo(R"({"data":{"user":{"roomId":"7300","status":2},"liveRoom":{"status":2}},"statusCode":0})");
+    CHECK(room.found && room.live && room.roomId == "7300");
+    room = TikTokClient::parseRoomInfo(R"({"data":{"user":{"roomId":"7300","status":4}},"statusCode":0})");
+    CHECK(room.found && !room.live);
+    room = TikTokClient::parseRoomInfo(R"(<script>{"liveRoomUserInfo":{"user":{"roomId":"7301","status":2}}}</script>)");
+    CHECK(room.found && room.live && room.roomId == "7301");
+    room = TikTokClient::parseRoomInfo(R"({"data":{},"statusCode":19881007,"message":"user_not_found"})");
+    CHECK(!room.found);
+}
+
 int main() {
     testTwitchParse();
     testKickParse();
@@ -373,6 +489,8 @@ int main() {
     testArabicDetection();
     testSlang();
     testArabicAndSlangDecisions();
+    testKickLookup();
+    testTikTokProtocol();
     testSettingsSanitize();
     if (failures) {
         std::cerr << failures << " check(s) failed\n";

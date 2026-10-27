@@ -1,6 +1,6 @@
 # Unified Stream Chat (C++)
 
-A lightweight C++ app that merges **YouTube**, **Twitch** and **Kick** live chat into one feed. It works two ways at the same time (**hybrid mode**):
+A lightweight C++ app that merges **YouTube**, **Twitch**, **Kick** and **TikTok LIVE** chat into one feed. It works two ways at the same time (**hybrid mode**):
 
 - **Desktop app:** a native window (WebView2 on Windows) with the full chat UI and settings.
 - **Web / OBS:** a built-in local web server, so the same chat can be added to OBS as a **Custom Browser Dock** or **Browser Source**, or opened in any browser.
@@ -15,17 +15,19 @@ It also translates messages with Google Translate and reads them aloud with Goog
  Twitch  (IRC/WS) ────┤                 ┌─► Bot filter (drop bots)      │
  YouTube (Data API) ──┼─► clients ──────┤─► Google Translate            │
  Kick    (Pusher WS) ─┤                 └─► TTS ─► AudioPlayer ─► chosen speaker
+ TikTok  (webcast WS)─┤
                       └─────────────────────────────────────────────────┘
 ```
 
 ## Features
 
 - **Hybrid mode.** Double-click `UnifiedStreamChat.exe` and it opens its own window. The OBS/browser links keep working while it runs. Use `--no-window` to run only the server. Closing the window quits the app.
-- **One feed, three platforms.** Every message shows the platform logo and color code (a colored stripe and the logo in that color) next to the username. You can change the colors. Twitch and Kick emotes and role badges are shown.
+- **One feed, four platforms.** Every message shows the platform logo and color code (a colored stripe and the logo in that color) next to the username. You can change the colors. Twitch and Kick emotes and role badges are shown.
 - **Logins:**
   - **Twitch:** OAuth2 login.
   - **YouTube:** Google OAuth2 login. The app finds your active live stream on its own.
-  - **Kick:** just type your username.
+  - **Kick:** just type your username. The chatroom is looked up once and remembered.
+  - **TikTok LIVE:** type the @username. This needs a signing-server API key (see below).
 - **Google Translate.** English messages stay as written, with the translated Arabic line right below them. The target language can be changed.
   - **Arabic is never translated.** Arabic in any dialect or casual spelling ("هاي", "شلونك", Iraqi/Gulf "شگد", "چا") is shown and read exactly as written, with the Arabic voice.
     - The app recognizes Arabic from the letters themselves and never sends it to Google. Google's detection often labels short dialect words as Persian or Urdu, which used to cause unwanted "translations".
@@ -147,7 +149,35 @@ Login uses your own developer app, so no third-party server is involved. Each on
 Quota note: each chat poll costs API quota units, and the default quota is 10,000 units per day. The app respects YouTube's `pollingIntervalMillis` and never polls faster than the **Minimum poll interval** setting (6 s by default). If you stream for long sessions, raise the interval or ask Google for more quota.
 
 ### Kick
-Enter your channel name and turn it on. If Kick's Cloudflare protection blocks the channel lookup, the status shows an error. In that case, open `https://kick.com/api/v2/channels/<name>` in your browser, copy `chatroom.id`, and paste it into *Kick → Troubleshooting → Chatroom ID*.
+Enter your channel name and turn it on. The line under the Kick card always says what is happening, and why if something fails.
+
+How it connects:
+1. **Chatroom ID.** It comes from, in order:
+   - a manual override
+   - the ID remembered for this username (`kick.resolvedChatroomId` in `settings.json`)
+   - a lookup on `kick.com/api/v2/channels/<name>`, then `/chatroom`, then `/api/v1/channels/<name>`
+
+   A successful lookup is saved, so it only has to succeed once.
+2. **Pusher WebSocket.** It connects to `wss://ws-us2.pusher.com/app/<key>` with `Origin: https://kick.com` and subscribes to `chatrooms.<id>.v2` and `chatroom_<id>`.
+3. **Connected.** The status turns *connected* only when Kick confirms the subscription. If that doesn't happen within 15 s, the app shows an error and reconnects.
+
+Pusher error codes 4000–4099 (wrong key, app disabled, origin rejected) are shown as errors and retried after 60 s, instead of looping on "connecting".
+
+**If Cloudflare blocks the lookup** ("Kick blocked the automatic lookup"), click **Find chatroom ID**:
+1. Your own browser opens the channel's data page (browsers get past Cloudflare).
+2. Select all and copy (Ctrl+A, Ctrl+C), then paste it into the box. Just the chatroom number works too.
+3. Click **Use this**.
+
+This is needed once per channel. **Re-detect** forgets the saved ID. If Kick ever changes its Pusher key, update it under *Kick → Troubleshooting*.
+
+### TikTok LIVE
+TikTok has no public API for reading LIVE chat. The app uses TikTok's internal *webcast* protocol, the same one the open-source TikTok-Live-Connector and TikTokLive projects use:
+
+1. `tiktok.com/api-live/user/room` (fallback: the `@user/live` page) finds the room ID and whether the user is live. While the user is offline, the status is *waiting* and the app checks again every 60 s.
+2. A **signing server** turns the room ID into a signed WebSocket URL and cookies. TikTok requires anti-bot signatures that change often, so this step is delegated: the default is Euler Stream (`https://tiktok.eulerstream.com`), which has a free API key. Paste the key in *Connections → TikTok LIVE → Signing server*. Both protobuf and JSON responses are accepted.
+3. The WebSocket carries binary `WebcastPushFrame` protobufs with gzip payloads (decoded with a built-in protobuf reader and miniz). The app sends an enter-room frame, acknowledges frames that ask for it, and sends a heartbeat every 10 s. `WebcastChatMessage` events become chat messages. A `WebcastControlMessage` with "stream ended" switches back to *waiting*.
+
+The TikTok protocol changes without notice. The field numbers and endpoints are all in `src/platforms/TikTokClient.cpp`, so they can be updated in one place.
 
 ### Google Translate / TTS
 Nothing is needed by default: the app uses Google's public Translate and Translate-TTS endpoints. For higher reliability and better voices (WaveNet/Neural2), create a Google Cloud API key with **Cloud Translation API** and **Cloud Text-to-Speech API** enabled, then paste it into *Translation → Google Cloud*. You can also set a voice name such as `ar-XA-Wavenet-B`.

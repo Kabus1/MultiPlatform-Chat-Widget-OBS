@@ -17,9 +17,11 @@ namespace usc {
 struct WebSocketClient::Impl {
     std::string url;
     Callbacks cb;
+    Options opt;
     std::thread thread;
     std::atomic<bool> running{false};
     std::atomic<bool> dropRequested{false};
+    std::atomic<int> nextDelayMs{0};
     std::mutex mutex; // guards socket
     HINTERNET socket = nullptr;
     std::mutex sleepMutex;
@@ -27,11 +29,16 @@ struct WebSocketClient::Impl {
 
     void run();
     HINTERNET connect(std::string& error);
-    void readLoop(HINTERNET ws);
+    // Returns the close code (1006 when the connection dropped without one).
+    USHORT readLoop(HINTERNET ws, std::string& reason);
     void closeSocket();
 };
 
 HINTERNET WebSocketClient::Impl::connect(std::string& error) {
+    if (opt.urlProvider) {
+        std::string fresh = opt.urlProvider();
+        if (!fresh.empty()) url = fresh;
+    }
     winhttp::ParsedUrl u;
     if (!winhttp::parseUrl(url, u)) {
         error = "invalid URL";
@@ -48,6 +55,12 @@ HINTERNET WebSocketClient::Impl::connect(std::string& error) {
         error = winhttp::lastError("open request");
         return nullptr;
     }
+    std::string hdrs;
+    for (const auto& [k, v] : opt.headers) hdrs += k + ": " + v + "\r\n";
+    std::wstring whdrs = winhttp::widen(hdrs);
+    if (!whdrs.empty())
+        WinHttpAddRequestHeaders(req.get(), whdrs.c_str(), static_cast<DWORD>(-1),
+                                 WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
     if (!WinHttpSetOption(req.get(), WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET, nullptr, 0) ||
         !WinHttpSendRequest(req.get(), WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
         !WinHttpReceiveResponse(req.get(), nullptr)) {
@@ -66,7 +79,7 @@ HINTERNET WebSocketClient::Impl::connect(std::string& error) {
     return ws; // the request handle may be closed once upgraded
 }
 
-void WebSocketClient::Impl::readLoop(HINTERNET ws) {
+USHORT WebSocketClient::Impl::readLoop(HINTERNET ws, std::string& reason) {
     std::vector<char> buf(64 * 1024);
     std::string message;
     while (running && !dropRequested) {
@@ -75,16 +88,30 @@ void WebSocketClient::Impl::readLoop(HINTERNET ws) {
         DWORD err = WinHttpWebSocketReceive(ws, buf.data(), static_cast<DWORD>(buf.size()), &read, &type);
         if (err != ERROR_SUCCESS) {
             if (running && !dropRequested && cb.onError) cb.onError("receive failed (" + std::to_string(err) + ")");
-            return;
+            reason = "connection lost";
+            return 1006;
         }
-        if (type == WINHTTP_WEB_SOCKET_CLOSE_BUFFER_TYPE) return;
+        if (type == WINHTTP_WEB_SOCKET_CLOSE_BUFFER_TYPE) {
+            USHORT code = 1005;
+            char r[124] = {};
+            DWORD used = 0;
+            if (WinHttpWebSocketQueryCloseStatus(ws, &code, r, sizeof(r), &used) == ERROR_SUCCESS)
+                reason.assign(r, used);
+            return code;
+        }
         message.append(buf.data(), read);
-        if (type == WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE || type == WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE) {
+        if (type == WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE) {
             if (cb.onMessage) cb.onMessage(message);
+            message.clear();
+        } else if (type == WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE) {
+            if (cb.onBinary) cb.onBinary(message);
+            else if (cb.onMessage) cb.onMessage(message);
             message.clear();
         }
         // *_FRAGMENT_BUFFER_TYPE: keep accumulating
     }
+    reason = "closed by client";
+    return 1000;
 }
 
 void WebSocketClient::Impl::closeSocket() {
@@ -110,22 +137,27 @@ void WebSocketClient::Impl::run() {
             backoffMs = 1000;
             dropRequested = false;
             if (cb.onOpen) cb.onOpen();
-            readLoop(ws);
+            std::string reason;
+            USHORT code = readLoop(ws, reason);
             closeSocket();
             if (!running) return;
-            if (cb.onClose) cb.onClose();
+            if (cb.onClose) cb.onClose(code, reason);
         } else if (cb.onError) {
             cb.onError(error);
         }
+        int wait = nextDelayMs.exchange(0);
+        if (wait <= 0) wait = backoffMs;
         std::unique_lock<std::mutex> lock(sleepMutex);
-        sleepCv.wait_for(lock, std::chrono::milliseconds(backoffMs), [&] { return !running.load(); });
+        sleepCv.wait_for(lock, std::chrono::milliseconds(wait), [&] { return !running.load(); });
         backoffMs = std::min(backoffMs * 2, 30000);
     }
 }
 
-WebSocketClient::WebSocketClient(std::string url, Callbacks callbacks) : impl_(std::make_unique<Impl>()) {
+WebSocketClient::WebSocketClient(std::string url, Callbacks callbacks, Options options)
+    : impl_(std::make_unique<Impl>()) {
     impl_->url = std::move(url);
     impl_->cb = std::move(callbacks);
+    impl_->opt = std::move(options);
 }
 
 WebSocketClient::~WebSocketClient() { stop(); }
@@ -145,11 +177,21 @@ void WebSocketClient::stop() {
     if (impl_->thread.joinable()) impl_->thread.join();
 }
 
+namespace {
+bool sendFrame(std::mutex& m, HINTERNET& socket, WINHTTP_WEB_SOCKET_BUFFER_TYPE type, const std::string& data) {
+    std::lock_guard<std::mutex> lock(m);
+    if (!socket) return false;
+    return WinHttpWebSocketSend(socket, type, const_cast<char*>(data.data()), static_cast<DWORD>(data.size())) ==
+           ERROR_SUCCESS;
+}
+} // namespace
+
 bool WebSocketClient::send(const std::string& text) {
-    std::lock_guard<std::mutex> lock(impl_->mutex);
-    if (!impl_->socket) return false;
-    return WinHttpWebSocketSend(impl_->socket, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE,
-                                const_cast<char*>(text.data()), static_cast<DWORD>(text.size())) == ERROR_SUCCESS;
+    return sendFrame(impl_->mutex, impl_->socket, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE, text);
+}
+
+bool WebSocketClient::sendBinary(const std::string& data) {
+    return sendFrame(impl_->mutex, impl_->socket, WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE, data);
 }
 
 void WebSocketClient::reconnect() {
@@ -159,5 +201,7 @@ void WebSocketClient::reconnect() {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     if (impl_->socket) WinHttpWebSocketShutdown(impl_->socket, WINHTTP_WEB_SOCKET_SUCCESS_CLOSE_STATUS, nullptr, 0);
 }
+
+void WebSocketClient::setNextRetryDelay(int ms) { impl_->nextDelayMs = ms; }
 
 } // namespace usc

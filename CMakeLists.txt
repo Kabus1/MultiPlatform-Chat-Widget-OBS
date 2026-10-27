@@ -73,6 +73,18 @@ if(NOT miniaudio_POPULATED)
   FetchContent_Populate(miniaudio) # header only: no add_subdirectory
 endif()
 
+# miniz: gzip/deflate for TikTok's compressed WebSocket payloads (works on
+# Windows without zlib).
+set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(BUILD_FUZZERS OFF CACHE BOOL "" FORCE)
+set(BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(INSTALL_PROJECT OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(miniz
+  GIT_REPOSITORY https://github.com/richgel999/miniz.git
+  GIT_TAG 3.0.2
+  GIT_SHALLOW ON)
+FetchContent_MakeAvailable(miniz)
+
 # --- Native desktop window (webview: WebView2 / WKWebView / WebKitGTK) ------
 # Windows and macOS always get the window. Linux gets it when WebKitGTK
 # development files are installed; otherwise the build is server-only.
@@ -151,6 +163,7 @@ add_library(usc_core STATIC
   src/platforms/TwitchClient.cpp
   src/platforms/YouTubeClient.cpp
   src/platforms/KickClient.cpp
+  src/platforms/TikTokClient.cpp
   src/services/Translator.cpp
   src/services/TtsService.cpp
   src/services/AudioPlayer.cpp
@@ -168,7 +181,7 @@ target_compile_definitions(usc_core PUBLIC
   CPPHTTPLIB_THREAD_POOL_COUNT=16
   APP_VERSION="${PROJECT_VERSION}")
 
-target_link_libraries(usc_core PUBLIC nlohmann_json::nlohmann_json Threads::Threads ${CMAKE_DL_LIBS})
+target_link_libraries(usc_core PUBLIC nlohmann_json::nlohmann_json Threads::Threads miniz ${CMAKE_DL_LIBS})
 if(USC_DESKTOP_WINDOW)
   target_compile_definitions(usc_core PUBLIC USC_HAS_WEBVIEW)
   target_link_libraries(usc_core PUBLIC webview::core)

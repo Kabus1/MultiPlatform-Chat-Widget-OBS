@@ -12,8 +12,22 @@ struct Response {
     std::string body;
     std::string error;    // transport error description
     std::string contentType;
+    std::vector<std::pair<std::string, std::string>> headers; // all response headers, in order
 
     bool ok() const { return status >= 200 && status < 300; }
+
+    // All values of a header (case-insensitive), e.g. every Set-Cookie line.
+    std::vector<std::string> headerValues(const std::string& name) const {
+        std::vector<std::string> out;
+        for (const auto& [k, v] : headers) {
+            if (k.size() != name.size()) continue;
+            bool same = true;
+            for (size_t i = 0; i < k.size() && same; ++i)
+                same = (k[i] | 0x20) == (name[i] | 0x20);
+            if (same) out.push_back(v);
+        }
+        return out;
+    }
 };
 
 using Headers = std::vector<std::pair<std::string, std::string>>;

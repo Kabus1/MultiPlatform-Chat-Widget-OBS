@@ -124,6 +124,26 @@ Response request(const wchar_t* method, const std::string& url, const Headers& h
                             WINHTTP_NO_HEADER_INDEX))
         out.contentType = narrow(std::wstring(ct, ctSize / sizeof(wchar_t)));
 
+    // All headers ("Name: value\r\n" lines), e.g. for Set-Cookie.
+    DWORD rawSize = 0;
+    WinHttpQueryHeaders(req.get(), WINHTTP_QUERY_RAW_HEADERS_CRLF, WINHTTP_HEADER_NAME_BY_INDEX, WINHTTP_NO_OUTPUT_BUFFER,
+                        &rawSize, WINHTTP_NO_HEADER_INDEX);
+    if (rawSize > 0) {
+        std::wstring raw(rawSize / sizeof(wchar_t), L'\0');
+        if (WinHttpQueryHeaders(req.get(), WINHTTP_QUERY_RAW_HEADERS_CRLF, WINHTTP_HEADER_NAME_BY_INDEX, raw.data(),
+                                &rawSize, WINHTTP_NO_HEADER_INDEX)) {
+            std::string all = narrow(raw.substr(0, rawSize / sizeof(wchar_t)));
+            size_t pos = all.find("\r\n"); // skip the status line
+            while (pos != std::string::npos && pos + 2 < all.size()) {
+                size_t end = all.find("\r\n", pos + 2);
+                std::string line = all.substr(pos + 2, end == std::string::npos ? std::string::npos : end - pos - 2);
+                if (auto colon = line.find(':'); colon != std::string::npos)
+                    out.headers.emplace_back(line.substr(0, colon), util::trim(line.substr(colon + 1)));
+                pos = end;
+            }
+        }
+    }
+
     std::vector<char> buf;
     for (;;) {
         DWORD avail = 0;
