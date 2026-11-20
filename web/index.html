@@ -70,14 +70,21 @@
           <button data-logout="youtube">Logout</button>
           <button data-reconnect="youtube">Reconnect</button>
         </div>
+        <p class="hint">Log in once: the login is saved and reused after restarts and every new stream, until you click Logout. Streaming on a Brand Account? Pick that channel when Google asks.</p>
         <details>
-          <summary>API credentials &amp; stream</summary>
-          <label>OAuth Client ID<input type="text" data-key="youtube.clientId" autocomplete="off" spellcheck="false"></label>
-          <label>OAuth Client Secret<input type="password" data-key="youtube.clientSecret" autocomplete="off"></label>
-          <label>Video ID / URL <small>(empty = your active live stream)</small><input type="text" data-key="youtube.videoId" placeholder="https://youtube.com/live/..."></label>
+          <summary>Stream</summary>
+          <label>Video ID / URL <small>(empty = your live or upcoming stream, found automatically)</small><input type="text" data-key="youtube.videoId" placeholder="https://youtube.com/live/..."></label>
           <label>Minimum poll interval (ms)<input type="number" min="2000" step="500" data-key="youtube.minPollMs"></label>
           <label class="check"><input type="checkbox" data-key="youtube.showBacklog"> Show recent messages on connect</label>
-          <p class="hint">Create a "Desktop app" OAuth client in Google Cloud Console (YouTube Data API v3 enabled). Redirect URL:</p>
+        </details>
+        <details>
+          <summary>Google client <small data-yt-cred></small></summary>
+          <p class="hint">The app has its own Google client, so normally nothing is needed here.</p>
+          <p class="hint warn-text" data-yt-cred-error></p>
+          <label>Client secret <small>(only if this build has none)</small><input type="password" data-key="youtube.clientSecret" autocomplete="off"></label>
+          <label class="check"><input type="checkbox" data-key="youtube.useCustomCredentials"> Use my own Google credentials instead</label>
+          <label>My OAuth Client ID<input type="text" data-key="youtube.clientId" autocomplete="off" spellcheck="false" placeholder="only with the option above"></label>
+          <p class="hint">Own credentials: a "Desktop app" OAuth client with YouTube Data API v3 enabled, published to Production. Redirect URL:</p>
           <div class="copy-row"><code data-redirect="youtube"></code><button data-copy="youtube">Copy</button></div>
         </details>
       </div>

@@ -20,6 +20,9 @@ public:
     virtual ~PlatformClient() = default;
     virtual void start() = 0;
     virtual void stop() = 0; // must be idempotent and join all threads
+    // "Reconnect" for clients that wait between checks: re-check right now
+    // instead of waiting for the next timer. Default: nothing (restart instead).
+    virtual bool checkNow() { return false; }
 };
 
 } // namespace usc

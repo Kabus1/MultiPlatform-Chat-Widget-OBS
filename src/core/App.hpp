@@ -61,7 +61,10 @@ public:
 
 private:
     std::optional<TokenSet> validToken(const std::string& platform, bool forceRefresh);
-    std::optional<oauth::Provider> provider(const std::string& platform, std::string& error);
+    std::optional<oauth::Provider> provider(const std::string& platform, std::string& error,
+                                            const std::string& forClientId = "");
+    // Why there is no usable token right now (shown in the platform status).
+    std::string authProblem(const std::string& platform);
     void restartPlatform(const std::string& platform);
     void setStatus(const std::string& platform, const std::string& state, const std::string& detail);
     void fetchAccountInfo(const std::string& platform, TokenSet& t);
@@ -84,7 +87,14 @@ private:
     std::map<std::string, nlohmann::json> status_;
 
     std::mutex authMutex_;
-    std::map<std::string, std::string> pendingStates_; // state -> platform
+    struct PendingLogin {
+        std::string platform;
+        std::string verifier; // PKCE code_verifier
+        int64_t createdAt = 0;
+    };
+    std::map<std::string, PendingLogin> pendingStates_; // OAuth state -> attempt
+    std::map<std::string, std::string> authError_;      // platform -> last auth problem
+    std::map<std::string, int64_t> refreshRetryAtMs_;   // back-off after a failed refresh
 };
 
 } // namespace usc

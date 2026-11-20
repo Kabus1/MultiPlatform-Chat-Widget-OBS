@@ -308,7 +308,17 @@
           acc.classList.toggle('warn-text', st.state === 'error');
         } else {
           acc.textContent = st.loggedIn ? `Logged in as ${st.account || '(unknown)'}` : 'Not logged in';
-          if (st.detail && st.state !== 'connected') acc.textContent += ` — ${st.detail}`;
+          // A login problem (expired session, rejected client) wins over the
+          // connection detail, because it is what the user has to act on.
+          const why = st.authError || (st.state !== 'connected' || p === 'youtube' ? st.detail : '');
+          if (why) acc.textContent += ` — ${why}`;
+          acc.classList.toggle('warn-text', st.state === 'error' || !!st.authError);
+        }
+        if (p === 'youtube') {
+          const cred = $('[data-yt-cred]');
+          if (cred) cred.textContent = st.credentials ? `(${st.credentials})` : '';
+          const credErr = $('[data-yt-cred-error]');
+          if (credErr) credErr.textContent = st.credentialsError || '';
         }
       }
       const redirect = $(`[data-redirect="${p}"]`);
@@ -580,7 +590,7 @@
       const s = JSON.parse(e.data);
       status.platforms[s.platform] = Object.assign(status.platforms[s.platform] || {}, { state: s.state, detail: s.detail });
       // Login state may have changed; refresh the full picture.
-      if (s.state === 'connected' || s.state === 'disabled' || s.state === 'error')
+      if (s.state === 'connected' || s.state === 'disabled' || s.state === 'error' || s.state === 'waiting')
         api('/api/status').then((st) => { status = st; renderStatus(); }).catch(() => {});
       renderStatus();
     });

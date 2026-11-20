@@ -15,7 +15,9 @@ Provider twitch(const std::string& clientId, const std::string& clientSecret, co
             "https://id.twitch.tv/oauth2/token",
             {"chat:read"},
             {{"force_verify", "false"}},
-            clientId, clientSecret, redirectUri};
+            clientId, clientSecret, redirectUri,
+            false,
+            ""};
 }
 
 Provider google(const std::string& clientId, const std::string& clientSecret, const std::string& redirectUri) {
@@ -23,11 +25,20 @@ Provider google(const std::string& clientId, const std::string& clientSecret, co
             "https://accounts.google.com/o/oauth2/v2/auth",
             "https://oauth2.googleapis.com/token",
             {"https://www.googleapis.com/auth/youtube.readonly"},
-            {{"access_type", "offline"}, {"prompt", "consent"}},
-            clientId, clientSecret, redirectUri};
+            // offline + consent: always returns a refresh token, so the login
+            // survives restarts. select_account lets the user pick the
+            // Google account / Brand Account that owns the YouTube channel.
+            {{"access_type", "offline"}, {"prompt", "consent select_account"}, {"include_granted_scopes", "true"}},
+            clientId, clientSecret, redirectUri,
+            true,
+            "https://oauth2.googleapis.com/revoke"};
 }
 
-std::string buildAuthUrl(const Provider& p, const std::string& state) {
+std::string makeCodeVerifier() { return util::randomToken(32); } // 64 chars of [0-9a-f]
+
+std::string codeChallenge(const std::string& verifier) { return util::base64UrlEncode(util::sha256(verifier)); }
+
+std::string buildAuthUrl(const Provider& p, const std::string& state, const std::string& challenge) {
     std::string scope;
     for (const auto& s : p.scopes) scope += (scope.empty() ? "" : " ") + s;
     http::Params q = {
@@ -38,6 +49,10 @@ std::string buildAuthUrl(const Provider& p, const std::string& state) {
         {"state", state},
     };
     for (const auto& kv : p.extraAuthParams) q.push_back(kv);
+    if (p.pkce && !challenge.empty()) {
+        q.push_back({"code_challenge", challenge});
+        q.push_back({"code_challenge_method", "S256"});
+    }
     return p.authUrl + "?" + http::buildQuery(q);
 }
 
@@ -45,8 +60,22 @@ namespace {
 
 Result parseTokenResponse(const http::Response& r, const std::string& previousRefresh) {
     Result out;
+    out.httpStatus = r.status;
     if (!r.ok()) {
-        out.error = r.status == 0 ? r.error : ("HTTP " + std::to_string(r.status) + ": " + r.body.substr(0, 300));
+        if (r.status == 0) {
+            out.error = "no connection to the login server (" + r.error + ")";
+            return out;
+        }
+        // OAuth errors: {"error": "invalid_grant", "error_description": "..."}
+        json e = json::parse(r.body, nullptr, false);
+        if (e.is_object()) {
+            if (e.contains("error") && e["error"].is_string()) out.oauthError = e["error"].get<std::string>();
+            std::string desc = e.value("error_description", e.value("message", std::string()));
+            out.error = (out.oauthError.empty() ? "HTTP " + std::to_string(r.status) : out.oauthError) +
+                        (desc.empty() ? "" : ": " + desc);
+        } else {
+            out.error = "HTTP " + std::to_string(r.status) + ": " + r.body.substr(0, 200);
+        }
         return out;
     }
     try {
@@ -69,25 +98,36 @@ Result parseTokenResponse(const http::Response& r, const std::string& previousRe
 
 } // namespace
 
-Result exchangeCode(const Provider& p, const std::string& code) {
-    auto r = http::postForm(p.tokenUrl, {
+Result exchangeCode(const Provider& p, const std::string& code, const std::string& codeVerifier) {
+    http::Params form = {
         {"client_id", p.clientId},
-        {"client_secret", p.clientSecret},
         {"code", code},
         {"grant_type", "authorization_code"},
         {"redirect_uri", p.redirectUri},
-    });
-    return parseTokenResponse(r, "");
+    };
+    if (!p.clientSecret.empty()) form.push_back({"client_secret", p.clientSecret});
+    if (!codeVerifier.empty()) form.push_back({"code_verifier", codeVerifier});
+    auto r = http::postForm(p.tokenUrl, form);
+    Result res = parseTokenResponse(r, "");
+    if (res.tokens) res.tokens->clientId = p.clientId;
+    return res;
+}
+
+void revoke(const Provider& p, const std::string& token) {
+    if (p.revokeUrl.empty() || token.empty()) return;
+    http::postForm(p.revokeUrl, {{"token", token}}, {}, 5);
 }
 
 Result refresh(const Provider& p, const std::string& refreshToken) {
-    auto r = http::postForm(p.tokenUrl, {
+    http::Params form = {
         {"client_id", p.clientId},
-        {"client_secret", p.clientSecret},
         {"refresh_token", refreshToken},
         {"grant_type", "refresh_token"},
-    });
-    return parseTokenResponse(r, refreshToken);
+    };
+    if (!p.clientSecret.empty()) form.push_back({"client_secret", p.clientSecret});
+    Result res = parseTokenResponse(http::postForm(p.tokenUrl, form), refreshToken);
+    if (res.tokens) res.tokens->clientId = p.clientId;
+    return res;
 }
 
 } // namespace usc::oauth

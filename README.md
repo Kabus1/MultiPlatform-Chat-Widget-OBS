@@ -141,12 +141,34 @@ Login uses your own developer app, so no third-party server is involved. Each on
 5. Click **Login with Twitch**. Your normal browser opens. After you approve, the dock shows *connected*.
 
 ### YouTube
-1. In <https://console.cloud.google.com/>, create a project and enable **YouTube Data API v3**.
-2. Set up the **OAuth consent screen** (External; add yourself as a test user).
-3. Go to **Credentials → Create credentials → OAuth client ID → Desktop app**. Google accepts loopback redirects such as `http://localhost:8787/auth/youtube/callback`. If you pick the *Web application* type instead, add that exact URL as an authorized redirect URI.
-4. Paste the Client ID and Secret into *Settings → Connections → YouTube* and click **Login with YouTube**.
+**Normally nothing to set up.** The app has its own Google OAuth client (Client ID `233537098772-9ehsehkjvebipcvomcjeujlhrfeocbe9.apps.googleusercontent.com`):
 
-Quota note: each chat poll costs API quota units, and the default quota is 10,000 units per day. The app respects YouTube's `pollingIntervalMillis` and never polls faster than the **Minimum poll interval** setting (6 s by default). If you stream for long sessions, raise the interval or ask Google for more quota.
+1. Click **Login with YouTube** once. If you stream on a Brand Account, pick that channel when Google asks.
+2. The login (access token, refresh token, expiry and account) is saved in `tokens.json` and renewed automatically. It survives restarts and new streams until you click **Logout**, which also revokes it at Google.
+
+How the login stays valid:
+- **Bound to its client.** Each login remembers which OAuth client created it and is always renewed with that same client, so changing credentials in Settings never breaks it.
+- **Only a dead token ends it.** A login is only dropped when Google says the refresh token itself is dead (`invalid_grant`).
+- **Other failures keep it.** Network errors, Google outages, rate limits or a rejected client secret keep the login, show the reason on the YouTube card, and retry.
+- **Secure flow.** The login uses PKCE with `access_type=offline` and `prompt=consent select_account`.
+
+**For whoever builds/distributes the app.**
+- **The client secret is not in git.** Inject it at build time with `cmake -DUSC_GOOGLE_CLIENT_SECRET=...`, or add a repository secret `USC_GOOGLE_CLIENT_SECRET` (GitHub → Settings → Secrets and variables → Actions) so the CI release builds include it. Google does not treat the secret of a *Desktop app* client as confidential.
+- **Builds without it.** Users can paste it once under *YouTube → Google client*, and it is saved.
+- **In the Google Cloud project for that client:**
+  1. Enable **YouTube Data API v3**.
+  2. Set the OAuth consent screen / Audience to **In production** (*Publish app*). While it is in **Testing**, Google expires every refresh token after **7 days** and only listed test users can log in. That is the usual cause of "I have to log in again every week". The app recognises this case (`invalid_grant`) and says so.
+  3. Because `youtube.readonly` is a sensitive scope, an unverified app shows a "Google hasn't verified this app" notice (*Advanced → Go to …*) and allows up to 100 users. Submit the app for verification to remove both.
+- **Your own client.** *Use my own Google credentials* (under *Google client*) switches to your own client. It must be a "Desktop app" OAuth client, and the redirect URL is shown there.
+
+**Stream detection.** In order:
+1. The video in *Stream → Video ID* if set. An ended video falls through to the next steps instead of blocking.
+2. Your **live** broadcast.
+3. A broadcast in preview, about to start, or the persistent "Stream now" one. Its chat opens before you go live and continues when you do. While on such a chat, the app re-checks every 60 s in case a different broadcast goes live.
+
+If nothing is found, the status is *waiting*, with the channel name and the reason, and it checks again every 15 s. **Reconnect** checks immediately, and also retries a failed login renewal right away. When a stream ends, the next one is searched for straight away.
+
+Quota note: each chat poll costs API quota units, and the default quota is 10,000 units per day. The app respects YouTube's `pollingIntervalMillis` and never polls faster than *Minimum poll interval* (6 s by default). Raise it for long streams, or ask Google for more quota.
 
 ### Kick
 Enter your channel name and turn it on. The line under the Kick card always says what is happening, and why if something fails.

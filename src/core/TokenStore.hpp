@@ -15,6 +15,9 @@ struct TokenSet {
     int64_t expiresAt = 0; // unix seconds, 0 = unknown
     std::string login;     // account name, for display
     std::string userId;
+    // OAuth client that issued the tokens. Refreshes must use the same client,
+    // so changing the app's credentials later never invalidates this login.
+    std::string clientId;
 
     bool expiringSoon(int64_t nowSec) const { return expiresAt != 0 && nowSec > expiresAt - 120; }
 };

@@ -6,6 +6,7 @@
 #include "core/MessagePipeline.hpp"
 #include "core/Settings.hpp"
 #include "core/Util.hpp"
+#include "net/OAuth.hpp"
 #include "net/Protobuf.hpp"
 #include "platforms/KickClient.hpp"
 #include "platforms/TikTokClient.hpp"
@@ -488,6 +489,59 @@ void testTikTokProtocol() {
     CHECK(!room.found);
 }
 
+std::string hex(const std::string& bytes) {
+    static const char* d = "0123456789abcdef";
+    std::string out;
+    for (unsigned char c : bytes) {
+        out.push_back(d[c >> 4]);
+        out.push_back(d[c & 15]);
+    }
+    return out;
+}
+
+void testOAuthHelpers() {
+    CHECK(hex(util::sha256("abc")) == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    CHECK(hex(util::sha256("")) == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+    CHECK(hex(util::sha256(std::string(1000, 'a'))) == "41edece42d63e8d9bf515a9ba6932e1c20cbc9f5a5d134645adb5db1b9737ea3");
+    CHECK(util::base64UrlEncode("\xfb\xff") == "-_8");
+    // RFC 7636 appendix B example.
+    CHECK(oauth::codeChallenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk") == "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM");
+    auto v = oauth::makeCodeVerifier();
+    CHECK(v.size() >= 43 && v.size() <= 128);
+
+    auto g = oauth::google("id.apps.googleusercontent.com", "s", "http://localhost:8787/auth/youtube/callback");
+    std::string url = oauth::buildAuthUrl(g, "st", oauth::codeChallenge(v));
+    CHECK(url.find("access_type=offline") != std::string::npos);
+    CHECK(url.find("code_challenge_method=S256") != std::string::npos);
+    CHECK(url.find("prompt=consent%20select_account") != std::string::npos);
+}
+
+void testYouTubeDetection() {
+    // Live broadcast wins.
+    json active = {{"items", json::array({{{"id", "v1"},
+                                            {"snippet", {{"liveChatId", "chat1"}, {"title", "My stream"}}},
+                                            {"status", {{"lifeCycleStatus", "live"}}}}})}};
+    auto b = YouTubeClient::pickBroadcast(active, true);
+    CHECK(b && b->chatId == "chat1" && b->live && b->title == "My stream");
+
+    // Upcoming: preview ("testing") beats a scheduled "ready" one; complete is ignored.
+    json upcoming = {{"items", json::array({
+                         {{"id", "a"}, {"snippet", {{"liveChatId", "chatReady"}}}, {"status", {{"lifeCycleStatus", "ready"}}}},
+                         {{"id", "b"}, {"snippet", {{"liveChatId", "chatTesting"}}}, {"status", {{"lifeCycleStatus", "testing"}}}},
+                         {{"id", "c"}, {"snippet", {{"liveChatId", "chatDone"}}}, {"status", {{"lifeCycleStatus", "complete"}}}},
+                         {{"id", "d"}, {"snippet", {{"title", "no chat"}}}, {"status", {{"lifeCycleStatus", "liveStarting"}}}},
+                     })}};
+    b = YouTubeClient::pickBroadcast(upcoming, false);
+    CHECK(b && b->chatId == "chatTesting" && !b->live);
+
+    CHECK(!YouTubeClient::pickBroadcast(json{{"items", json::array()}}, true));
+    CHECK(!YouTubeClient::pickBroadcast(json::parse("not json", nullptr, false), true));
+
+    CHECK(YouTubeClient::explainApiError("quotaExceeded", "X").find("quota") != std::string::npos);
+    CHECK(YouTubeClient::explainApiError("liveStreamingNotEnabled", "Ch").find("'Ch'") != std::string::npos);
+    CHECK(YouTubeClient::explainApiError("insufficientPermissions", "").find("Login with YouTube") != std::string::npos);
+}
+
 int main() {
     testTwitchParse();
     testKickParse();
@@ -503,6 +557,8 @@ int main() {
     testArabicAndSlangDecisions();
     testKickLookup();
     testTikTokProtocol();
+    testOAuthHelpers();
+    testYouTubeDetection();
     testSettingsSanitize();
     if (failures) {
         std::cerr << failures << " check(s) failed\n";

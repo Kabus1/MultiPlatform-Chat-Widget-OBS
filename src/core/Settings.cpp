@@ -23,9 +23,13 @@ json Settings::defaults() {
         }},
         {"youtube", {
             {"enabled", false},
+            // The app's built-in Google client is used unless useCustomCredentials
+            // is on. clientSecret alone may be filled in for builds made
+            // without a built-in secret (it then pairs with the built-in ID).
+            {"useCustomCredentials", false},
             {"clientId", ""},
             {"clientSecret", ""},
-            {"videoId", ""},   // empty = the logged-in account's active broadcast
+            {"videoId", ""},   // empty = the logged-in account's live / upcoming broadcast
             {"minPollMs", 6000}, // protects the 10k/day API quota
             {"showBacklog", true},
         }},

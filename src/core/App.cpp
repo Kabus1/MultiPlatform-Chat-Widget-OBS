@@ -1,5 +1,6 @@
 #include "core/App.hpp"
 
+#include "core/BuiltinCredentials.hpp"
 #include "core/Log.hpp"
 #include "core/Util.hpp"
 #include "net/Http.hpp"
@@ -70,46 +71,133 @@ std::string App::redirectUri(const std::string& platform) const {
     return "http://localhost:" + std::to_string(port_) + "/auth/" + platform + "/callback";
 }
 
-std::optional<oauth::Provider> App::provider(const std::string& platform, std::string& error) {
+namespace {
+
+struct GoogleClient {
+    std::string id;
+    std::string secret;
+    std::string source; // "built-in" | "custom"
+};
+
+// Which Google OAuth client to use. Built-in by default; the user's own only
+// when "Use my own Google credentials" is on. A login is always refreshed
+// with the client that created it (forClientId), so changing credentials in
+// Settings never breaks an existing login.
+std::optional<GoogleClient> pickGoogleClient(const json& yt, const std::string& forClientId, std::string& error) {
+    const std::string builtinId = builtin::kGoogleClientId;
+    const std::string builtinSecret = builtin::kGoogleClientSecret;
+    const std::string customId = util::trim(yt.value("clientId", ""));
+    const std::string customSecret = util::trim(yt.value("clientSecret", ""));
+    const bool customOn = yt.value("useCustomCredentials", false) && !customId.empty();
+
+    const std::string id = !forClientId.empty() ? forClientId : customOn ? customId : builtinId;
+    std::string secret;
+    if (id == builtinId) {
+        // The secret entered in Settings is accepted for the built-in client
+        // too, for builds made without USC_GOOGLE_CLIENT_SECRET.
+        secret = !builtinSecret.empty() ? builtinSecret
+                 : (customId.empty() || customId == builtinId) ? customSecret
+                                                               : std::string();
+    } else if (id == customId) {
+        secret = customSecret;
+    }
+    if (secret.empty()) {
+        error = !forClientId.empty() && forClientId != builtinId && forClientId != customId
+                    ? "Your saved YouTube login belongs to another Google client (" + forClientId +
+                          "). Click Login with YouTube once to move it to the current one."
+                    : "This build has no Google client secret. Enter it once under Settings > Connections > "
+                      "YouTube > Google client (it is saved), or build with USC_GOOGLE_CLIENT_SECRET.";
+        return std::nullopt;
+    }
+    return GoogleClient{id, secret, id == builtinId ? "built-in" : "custom"};
+}
+
+const char* kGrantRevokedHelp =
+    "Google ended the saved YouTube login (invalid_grant: the refresh token expired or was revoked). "
+    "Click Login with YouTube once. If this happens about every 7 days, the Google OAuth app is in "
+    "\"Testing\" mode: in Google Cloud Console > Google Auth Platform > Audience, click \"Publish app\" "
+    "so logins stop expiring.";
+
+} // namespace
+
+std::optional<oauth::Provider> App::provider(const std::string& platform, std::string& error,
+                                             const std::string& forClientId) {
     json s = settings_.snapshot();
-    if (platform != "twitch" && platform != "youtube") {
+    if (platform == "youtube") {
+        auto c = pickGoogleClient(s["youtube"], forClientId, error);
+        if (!c) return std::nullopt;
+        return oauth::google(c->id, c->secret, redirectUri(platform));
+    }
+    if (platform != "twitch") {
         error = "unknown platform";
         return std::nullopt;
     }
     std::string id = util::trim(s[platform].value("clientId", ""));
     std::string secret = util::trim(s[platform].value("clientSecret", ""));
     if (id.empty() || secret.empty()) {
-        error = "Enter the " + std::string(platform == "twitch" ? "Twitch" : "Google") +
-                " Client ID and Client Secret first (see README: Creating API credentials)";
+        error = "Enter the Twitch Client ID and Client Secret first (see README: Creating API credentials)";
         return std::nullopt;
     }
-    return platform == "twitch" ? oauth::twitch(id, secret, redirectUri(platform))
-                                : oauth::google(id, secret, redirectUri(platform));
+    return oauth::twitch(id, secret, redirectUri(platform));
+}
+
+std::string App::authProblem(const std::string& platform) {
+    std::lock_guard<std::mutex> lock(authMutex_);
+    if (auto it = authError_.find(platform); it != authError_.end()) return it->second;
+    if (!tokens_.get(platform))
+        return platform == "youtube" ? "Not logged in - click Login with YouTube (only once: the login is remembered)"
+                                     : "Not logged in - use Settings > Connections > Login with Twitch";
+    return {};
 }
 
 std::optional<TokenSet> App::validToken(const std::string& platform, bool forceRefresh) {
     std::lock_guard<std::mutex> lock(authMutex_);
     auto t = tokens_.get(platform);
     if (!t) return std::nullopt;
-    if (!(forceRefresh || t->expiringSoon(util::nowSec()))) return t;
-    if (t->refreshToken.empty()) return forceRefresh ? std::nullopt : t;
+    const int64_t now = util::nowSec();
+    const bool expired = t->expiresAt != 0 && now >= t->expiresAt;
+    if (!(forceRefresh || t->expiringSoon(now))) return t;
+    // Still-valid token: hand it out even if the early refresh below fails.
+    auto fallback = [&]() -> std::optional<TokenSet> {
+        return expired || forceRefresh ? std::nullopt : std::optional<TokenSet>(t);
+    };
+    if (t->refreshToken.empty()) return fallback();
+    // After a failed refresh, wait instead of hammering the token endpoint.
+    if (util::nowMs() < refreshRetryAtMs_[platform]) return fallback();
 
     std::string error;
-    auto p = provider(platform, error);
-    if (!p) return t;
+    auto p = provider(platform, error, t->clientId);
+    if (!p) {
+        authError_[platform] = error;
+        refreshRetryAtMs_[platform] = util::nowMs() + 60000;
+        return fallback();
+    }
     auto r = oauth::refresh(*p, t->refreshToken);
     if (!r.tokens) {
         LOG_WARN("auth", platform, " token refresh failed: ", r.error);
-        // 400/401 from the token endpoint means the grant was revoked.
-        if (r.error.rfind("HTTP 4", 0) == 0) {
+        if (r.grantRevoked()) {
+            // The refresh token itself is dead: only a new login helps.
             tokens_.erase(platform);
+            authError_[platform] = platform == "youtube" ? kGrantRevokedHelp
+                                                         : "Twitch ended the saved login. Click Login with Twitch again.";
             return std::nullopt;
         }
-        return t;
+        // Anything else (no network, Google outage, rate limit, rejected
+        // client credentials) is temporary or fixable: keep the login.
+        authError_[platform] =
+            r.oauthError == "invalid_client" || r.oauthError == "unauthorized_client"
+                ? "Google rejected the app's client ID/secret (" + r.oauthError +
+                      "). Your login is kept; check Settings > Connections > YouTube > Google client."
+                : "Could not renew the login (" + r.error + "). Your login is kept; retrying in 30s.";
+        refreshRetryAtMs_[platform] = util::nowMs() + 30000;
+        return fallback();
     }
     r.tokens->login = t->login;
     r.tokens->userId = t->userId;
+    if (r.tokens->clientId.empty()) r.tokens->clientId = p->clientId;
     tokens_.set(platform, *r.tokens);
+    authError_.erase(platform);
+    refreshRetryAtMs_.erase(platform);
     LOG_INFO("auth", platform, " token refreshed");
     return r.tokens;
 }
@@ -118,11 +206,15 @@ std::string App::beginLogin(const std::string& platform, std::string& error) {
     auto p = provider(platform, error);
     if (!p) return {};
     std::string state = util::randomToken();
+    std::string verifier = p->pkce ? oauth::makeCodeVerifier() : std::string();
     {
         std::lock_guard<std::mutex> lock(authMutex_);
-        pendingStates_[state] = platform;
+        // Forget abandoned attempts older than 15 minutes.
+        for (auto it = pendingStates_.begin(); it != pendingStates_.end();)
+            it = util::nowSec() - it->second.createdAt > 900 ? pendingStates_.erase(it) : std::next(it);
+        pendingStates_[state] = {platform, verifier, util::nowSec()};
     }
-    std::string url = oauth::buildAuthUrl(*p, state);
+    std::string url = oauth::buildAuthUrl(*p, state, verifier.empty() ? "" : oauth::codeChallenge(verifier));
     // OAuth runs in the system browser: Google refuses sign-in inside
     // embedded browsers such as the OBS dock.
     if (!util::openInSystemBrowser(url)) LOG_WARN("auth", "could not open a browser; open this URL manually:\n", url);
@@ -157,20 +249,30 @@ void App::fetchAccountInfo(const std::string& platform, TokenSet& t) {
 }
 
 std::string App::finishLogin(const std::string& platform, const std::string& code, const std::string& state) {
+    PendingLogin pending;
     {
         std::lock_guard<std::mutex> lock(authMutex_);
         auto it = pendingStates_.find(state);
-        if (it == pendingStates_.end() || it->second != platform) return "Invalid or expired login attempt (state mismatch). Please try again.";
+        if (it == pendingStates_.end() || it->second.platform != platform)
+            return "Invalid or expired login attempt (state mismatch). Please try again.";
+        pending = it->second;
         pendingStates_.erase(it);
     }
     std::string error;
     auto p = provider(platform, error);
     if (!p) return error;
-    auto r = oauth::exchangeCode(*p, code);
+    auto r = oauth::exchangeCode(*p, code, pending.verifier);
     if (!r.tokens) return "Token exchange failed: " + r.error;
+    if (r.tokens->refreshToken.empty())
+        LOG_WARN("auth", platform, " login returned no refresh token: it will last only about an hour");
     fetchAccountInfo(platform, *r.tokens);
-    tokens_.set(platform, *r.tokens);
-    LOG_INFO("auth", platform, " logged in as ", r.tokens->login);
+    {
+        std::lock_guard<std::mutex> lock(authMutex_);
+        tokens_.set(platform, *r.tokens); // persisted in tokens.json until Logout
+        authError_.erase(platform);
+        refreshRetryAtMs_.erase(platform);
+    }
+    LOG_INFO("auth", platform, " logged in as ", r.tokens->login, " (client ", r.tokens->clientId, ")");
 
     // Logging in implies the user wants this platform on.
     if (!settings_.snapshot()[platform].value("enabled", false))
@@ -181,9 +283,19 @@ std::string App::finishLogin(const std::string& platform, const std::string& cod
 }
 
 void App::logout(const std::string& platform) {
+    std::optional<TokenSet> t;
     {
         std::lock_guard<std::mutex> lock(authMutex_);
+        t = tokens_.get(platform);
         tokens_.erase(platform);
+        authError_.erase(platform);
+        refreshRetryAtMs_.erase(platform);
+    }
+    // Tell Google too, so the login is really gone (best effort).
+    if (t) {
+        std::string error;
+        if (auto p = provider(platform, error, t->clientId))
+            oauth::revoke(*p, t->refreshToken.empty() ? t->accessToken : t->refreshToken);
     }
     restartPlatform(platform);
 }
@@ -210,6 +322,20 @@ json App::status() {
         platforms[p]["loggedIn"] = t.has_value();
         platforms[p]["account"] = t ? t->login : "";
         platforms[p]["redirectUri"] = redirectUri(p);
+        std::string problem;
+        {
+            std::lock_guard<std::mutex> lock(authMutex_);
+            if (auto it = authError_.find(p); it != authError_.end()) problem = it->second;
+        }
+        platforms[p]["authError"] = problem;
+    }
+    {
+        // Which Google client a YouTube login uses (built-in unless overridden).
+        std::string err;
+        auto c = pickGoogleClient(settings_.snapshot()["youtube"], "", err);
+        platforms["youtube"]["credentials"] = c ? c->source : "missing";
+        platforms["youtube"]["credentialsError"] = c ? "" : err;
+        platforms["youtube"]["builtinClientId"] = builtin::kGoogleClientId;
     }
     json kick = settings_.snapshot()["kick"];
     platforms["kick"]["chatroomId"] = !kick.value("chatroomId", "").empty() ? kick.value("chatroomId", "")
@@ -252,8 +378,25 @@ json App::applySettings(const json& patch) {
 }
 
 void App::reconnect(const std::string& platform) {
-    for (const char* p : kPlatforms)
-        if (platform.empty() || platform == p) restartPlatform(p);
+    for (const char* p : kPlatforms) {
+        if (!platform.empty() && platform != p) continue;
+        // Clients that poll (YouTube) re-check immediately instead of being
+        // torn down; everything else is restarted.
+        bool checked = false;
+        {
+            std::lock_guard<std::mutex> lock(clientsMutex_);
+            if (auto it = clients_.find(p); it != clients_.end()) checked = it->second->checkNow();
+        }
+        if (checked) {
+            {
+                std::lock_guard<std::mutex> lock(authMutex_);
+                refreshRetryAtMs_.erase(p); // also retry a failed login renewal now
+            }
+            setStatus(p, "connecting", "Checking now...");
+        } else {
+            restartPlatform(p);
+        }
+    }
 }
 
 void App::restartPlatform(const std::string& platform) {
@@ -280,7 +423,8 @@ void App::restartPlatform(const std::string& platform) {
     } else if (platform == "youtube") {
         client = std::make_unique<YouTubeClient>(
             YouTubeClient::Config{cfg.value("videoId", ""), std::max(2000, cfg.value("minPollMs", 6000)),
-                                  cfg.value("showBacklog", true), tokens},
+                                  cfg.value("showBacklog", true), tokens,
+                                  [this] { return authProblem("youtube"); }},
             sink, status);
     } else if (platform == "kick") {
         KickClient::Config kc;

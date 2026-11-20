@@ -36,6 +36,7 @@ std::optional<TokenSet> TokenStore::get(const std::string& provider) const {
     t.expiresAt = j.value("expiresAt", int64_t{0});
     t.login = j.value("login", "");
     t.userId = j.value("userId", "");
+    t.clientId = j.value("clientId", "");
     if (t.accessToken.empty()) return std::nullopt;
     return t;
 }
@@ -48,6 +49,7 @@ void TokenStore::set(const std::string& provider, const TokenSet& t) {
         {"expiresAt", t.expiresAt},
         {"login", t.login},
         {"userId", t.userId},
+        {"clientId", t.clientId},
     };
     saveLocked();
 }

@@ -177,6 +177,18 @@ target_include_directories(usc_core PUBLIC
   ${httplib_SOURCE_DIR}
   ${miniaudio_SOURCE_DIR})
 
+# Built-in Google OAuth client (YouTube login without a Google Cloud setup).
+# The secret is never committed: pass -DUSC_GOOGLE_CLIENT_SECRET=... or set
+# the USC_GOOGLE_CLIENT_SECRET environment variable when configuring.
+set(USC_GOOGLE_CLIENT_ID "233537098772-9ehsehkjvebipcvomcjeujlhrfeocbe9.apps.googleusercontent.com"
+    CACHE STRING "Built-in Google OAuth client ID")
+set(USC_GOOGLE_CLIENT_SECRET "$ENV{USC_GOOGLE_CLIENT_SECRET}" CACHE STRING "Built-in Google OAuth client secret")
+if(USC_GOOGLE_CLIENT_SECRET STREQUAL "")
+  message(STATUS "No built-in Google client secret: YouTube login will need one in Settings (or set USC_GOOGLE_CLIENT_SECRET)")
+endif()
+set_source_files_properties(src/core/App.cpp PROPERTIES COMPILE_DEFINITIONS
+  "USC_GOOGLE_CLIENT_ID=\"${USC_GOOGLE_CLIENT_ID}\";USC_GOOGLE_CLIENT_SECRET=\"${USC_GOOGLE_CLIENT_SECRET}\"")
+
 target_compile_definitions(usc_core PUBLIC
   CPPHTTPLIB_THREAD_POOL_COUNT=16
   APP_VERSION="${PROJECT_VERSION}")
