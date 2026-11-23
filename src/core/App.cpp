@@ -44,6 +44,10 @@ App::App(const std::string& configDir, int portOverride)
                                         {"pusherCluster", KickClient::kDefaultPusherCluster}}}});
     settings_.save(); // writes defaults on first run so users can find the file
     for (const char* p : kPlatforms) status_[p] = {{"state", "disabled"}, {"detail", ""}};
+    capture_ = std::make_unique<capture::CaptureRelay>(
+        [this](const json& st) { hub_.publish("capture", st); },
+        // The user closed the output window: remember that, so it stays closed.
+        [this] { applySettings({{"capture", {{"enabled", false}}}}); });
 }
 
 App::~App() { shutdown(); }
@@ -54,6 +58,9 @@ void App::start() {
     if (settings_.snapshot()["ui"].value("thirdPartyEmotes", true)) emotes_.loadGlobalAsync();
     for (const char* p : kPlatforms) restartPlatform(p);
     restartObs();
+    capture_->start(); // idle (no thread wake-ups) until the relay is enabled
+    captureConfig_ = settings_.snapshot()["capture"];
+    capture_->apply(capture::RelayConfig::fromJson(captureConfig_));
 }
 
 void App::restartObs() {
@@ -99,6 +106,7 @@ void App::shutdown() {
         if (obs_) obs_->stop();
         obs_.reset();
     }
+    if (capture_) capture_->stop(); // releases the device before the process exits
     pipeline_.stop();
     audio_.stop();
     hub_.closeAll();
@@ -420,6 +428,13 @@ json App::applySettings(const json& patch) {
         obsChanged = obsConfig_ != s["obs"];
     }
     if (obsChanged) restartObs();
+    {
+        std::lock_guard<std::mutex> lock(obsMutex_);
+        if (captureConfig_ != s["capture"]) {
+            captureConfig_ = s["capture"];
+            capture_->apply(capture::RelayConfig::fromJson(captureConfig_)); // queued, never blocks
+        }
+    }
     hub_.publish("settings", s);
     return s;
 }

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "capture/CaptureRelay.hpp"
 #include "core/EmoteRegistry.hpp"
 #include "core/EventHub.hpp"
 #include "core/MessagePipeline.hpp"
@@ -60,6 +61,9 @@ public:
     nlohmann::json kickResolveFromText(const std::string& text);
     void kickForgetChatroom();
 
+    // Video capture relay (Elgato etc. -> Game-Capturable window).
+    capture::CaptureRelay& capture() { return *capture_; }
+
 private:
     std::optional<TokenSet> validToken(const std::string& platform, bool forceRefresh);
     std::optional<oauth::Provider> provider(const std::string& platform, std::string& error,
@@ -103,6 +107,9 @@ private:
     std::mutex obsMutex_;
     std::unique_ptr<ObsWatcher> obs_;
     nlohmann::json obsConfig_;
+
+    std::unique_ptr<capture::CaptureRelay> capture_;
+    nlohmann::json captureConfig_;
 };
 
 } // namespace usc

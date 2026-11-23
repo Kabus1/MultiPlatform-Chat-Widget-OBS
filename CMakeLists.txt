@@ -136,7 +136,10 @@ endif()
 set(WEB_FILES
   ${CMAKE_CURRENT_SOURCE_DIR}/web/index.html
   ${CMAKE_CURRENT_SOURCE_DIR}/web/app.css
-  ${CMAKE_CURRENT_SOURCE_DIR}/web/app.js)
+  ${CMAKE_CURRENT_SOURCE_DIR}/web/app.js
+  ${CMAKE_CURRENT_SOURCE_DIR}/web/capture.html
+  ${CMAKE_CURRENT_SOURCE_DIR}/web/capture.css
+  ${CMAKE_CURRENT_SOURCE_DIR}/web/capture.js)
 set(EMBED_OUT ${CMAKE_CURRENT_BINARY_DIR}/generated/EmbeddedAssets.cpp)
 add_custom_command(
   OUTPUT ${EMBED_OUT}
@@ -165,6 +168,9 @@ add_library(usc_core STATIC
   src/platforms/KickClient.cpp
   src/platforms/TikTokClient.cpp
   src/integrations/ObsWatcher.cpp
+  src/capture/CaptureTypes.cpp
+  src/capture/CaptureRelay.cpp
+  src/capture/CaptureStubs.cpp
   src/services/Translator.cpp
   src/services/TtsService.cpp
   src/services/AudioPlayer.cpp
@@ -206,10 +212,14 @@ endif()
 if(WIN32)
   target_sources(usc_core PRIVATE
     src/net/Http_winhttp.cpp
-    src/net/WebSocketClient_winhttp.cpp)
+    src/net/WebSocketClient_winhttp.cpp
+    src/capture/MfVideoBackend.cpp
+    src/capture/D3DOutputWindow.cpp)
   target_compile_definitions(usc_core PUBLIC
     NOMINMAX WIN32_LEAN_AND_MEAN= _WIN32_WINNT=0x0A00 UNICODE _UNICODE) # empty value matches webview.h
-  target_link_libraries(usc_core PUBLIC winhttp ws2_32 shell32 ole32 user32)
+  target_link_libraries(usc_core PUBLIC winhttp ws2_32 shell32 ole32 user32
+    # video capture relay: Media Foundation + Direct3D 11 + WIC (all in-box)
+    mfplat mf mfreadwrite mfuuid d3d11 dxgi windowscodecs uuid)
 else()
   target_sources(usc_core PRIVATE
     src/net/Http_httplib.cpp

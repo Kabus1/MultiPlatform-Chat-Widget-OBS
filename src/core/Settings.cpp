@@ -55,6 +55,18 @@ json Settings::defaults() {
             {"port", 4455},
             {"password", ""},
         }},
+        {"capture", {
+            // Video capture relay (Windows): one device -> a window OBS Game
+            // Capture / TikTok Studio can capture without fighting over the device.
+            {"enabled", false},
+            {"deviceId", ""},
+            {"deviceName", ""},
+            {"mode", "auto"},              // "auto" or "1920x1080@60/1:NV12"
+            {"outputResolution", "source"}, // source | 2160p | 1440p | 1080p | 720p
+            {"outputFps", 0},               // 0 = match source, else a cap
+            {"keepAspect", true},
+            {"windowTitle", "USC Capture Output"},
+        }},
         {"tiktok", {
             {"enabled", false},
             {"username", ""},

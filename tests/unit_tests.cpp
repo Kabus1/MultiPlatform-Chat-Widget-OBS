@@ -1,4 +1,5 @@
 // Minimal self-contained unit tests (no network): run with `ctest` or directly.
+#include "capture/CaptureTypes.hpp"
 #include "core/BotFilter.hpp"
 #include "core/EmoteRegistry.hpp"
 #include "core/LanguageTools.hpp"
@@ -583,6 +584,83 @@ void testViewerConnection() {
     CHECK(util::base64Encode("ab") == "YWI=" && util::base64Encode("abc") == "YWJj");
 }
 
+void testCaptureDecisions() {
+    using namespace usc::capture;
+    auto mk = [](int w, int h, uint32_t n, uint32_t d, const char* st) { return Mode{w, h, n, d, st}; };
+    std::vector<Mode> modes = {
+        mk(3840, 2160, 60, 1, "NV12"),  mk(3840, 2160, 30, 1, "NV12"), mk(1920, 1080, 120, 1, "NV12"),
+        mk(1920, 1080, 60, 1, "NV12"),  mk(1920, 1080, 60, 1, "MJPG"), mk(1920, 1080, 60, 1, "NV12"), // duplicate
+        mk(1280, 720, 144, 1, "YUY2"),  mk(1920, 1080, 60000, 1001, "YUY2"),
+    };
+    normalizeModes(modes);
+    CHECK(modes.size() == 7);
+    CHECK(modes.front().height == 2160 && modes.front().fpsNum == 60);
+
+    RelayConfig cfg;
+    std::string note;
+    // Match source: the most detail the device offers.
+    auto m = chooseMode(modes, cfg, note);
+    CHECK(m && m->height == 2160 && m->fps() == 60 && note.empty());
+    // 1080p output at 120: capture 1080p120, not 4K.
+    cfg.outputResolution = "1080p";
+    cfg.outputFps = 120;
+    m = chooseMode(modes, cfg, note);
+    CHECK(m && m->height == 1080 && m->fps() == 120);
+    // 1080p60: cheapest format among exact 60 fps modes, never MJPG.
+    cfg.outputFps = 60;
+    m = chooseMode(modes, cfg, note);
+    CHECK(m && m->height == 1080 && m->fps() == 60 && m->subtype == "NV12");
+    // 144 fps is only possible at 720p: reaching the FPS beats resolution.
+    cfg.outputFps = 144;
+    m = chooseMode(modes, cfg, note);
+    CHECK(m && m->height == 720 && m->fps() == 144);
+    // A saved mode that is offered is used as-is ...
+    cfg.mode = mk(1920, 1080, 60, 1, "MJPG").key();
+    m = chooseMode(modes, cfg, note);
+    CHECK(m && m->subtype == "MJPG" && note.empty());
+    // ... one that is not falls back to auto with an explanation.
+    cfg.mode = "2560x1440@240/1:NV12";
+    m = chooseMode(modes, cfg, note);
+    CHECK(m && m->height == 720 && !note.empty());
+    // Never returns something the device does not offer.
+    CHECK(!chooseMode({}, cfg, note));
+
+    RelayConfig out;
+    CHECK(outputSize(out, 1920, 1080) == std::make_pair(1920, 1080));
+    out.outputResolution = "720p";
+    CHECK(outputSize(out, 1920, 1080) == std::make_pair(1280, 720));
+    out.outputResolution = "2160p";
+    CHECK(outputSize(out, 1920, 1080) == std::make_pair(3840, 2160));
+    CHECK(outputSize(out, 2560, 1080).first % 2 == 0);
+
+    // 120 fps capped at 60: every other frame, no drift over 10 s.
+    FramePacer pacer(60);
+    int shown = 0;
+    for (int i = 0; i < 1200; ++i) shown += pacer.shouldPresent(int64_t(i) * 1000000 / 120);
+    CHECK(shown >= 595 && shown <= 605);
+    // 60 fps (with jitter) capped at 60: nothing dropped.
+    pacer.reset(60);
+    shown = 0;
+    for (int i = 0; i < 600; ++i) shown += pacer.shouldPresent(int64_t(i) * 16667 + (i % 2 ? 900 : -900));
+    CHECK(shown == 600);
+    // No cap: everything.
+    pacer.reset(0);
+    CHECK(pacer.shouldPresent(0) && pacer.shouldPresent(1));
+
+    RateMeter rm;
+    for (int i = 0; i < 60; ++i) rm.tick(10000 + i * 16);
+    CHECK(rm.rate(10000 + 60 * 16) > 50);
+    CHECK(rm.rate(20000) == 0);
+
+    RelayConfig a = RelayConfig::fromJson({{"enabled", true}, {"deviceId", "x"}, {"outputFps", 120}});
+    CHECK(a.enabled && a.deviceId == "x" && a.outputFps == 120 && a.mode == "auto");
+    RelayConfig b = a;
+    b.deviceName = "renamed";
+    CHECK(a.sameSession(b));
+    b.outputFps = 60;
+    CHECK(!a.sameSession(b));
+}
+
 int main() {
     testTwitchParse();
     testKickParse();
@@ -602,6 +680,7 @@ int main() {
     testYouTubeDetection();
     testViewerConnection();
     testSettingsSanitize();
+    testCaptureDecisions();
     if (failures) {
         std::cerr << failures << " check(s) failed\n";
         return 1;

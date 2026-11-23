@@ -37,6 +37,7 @@ It also translates messages with Google Translate and reads them aloud with Goog
     - The voice uses the same text: the expanded English in *original* mode, or the same Arabic line in *translated* mode.
     - Short slang is translated as English even when Google's detection guesses another language.
   - If Google's free endpoint rate-limits (HTTP 429), translation pauses for 60 s instead of retrying non-stop. A Google Cloud API key avoids the limit.
+- **Video capture relay (Windows).** One capture device (Elgato etc.) is shown in a window that OBS *Game Capture* and TikTok Studio can both capture, so the device is opened only once. It has its own page (🎥 button, or `/capture`). See [Video capture relay](#video-capture-relay-windows).
 - **Google TTS** with separate toggles for:
   - reading the username
   - reading the message text
@@ -230,6 +231,40 @@ The app connects to OBS's own WebSocket server (OBS 28+, *Tools → WebSocket Se
 - **It reacts to "stream started".** When OBS starts streaming (`StreamStateChanged`), YouTube and TikTok check right away and keep checking every 15 s for 3 minutes until the stream shows as live. Nothing needs to poll often while you are offline.
 - **It stays quiet when OBS is closed.** It retries every 30 s at most and only reports when its status changes.
 
+### Video capture relay (Windows)
+A capture card can be opened by only one program at a time. When OBS has a *Video Capture Device* source and TikTok Studio wants the same card, one of them fails. The relay opens the card **once** and shows it in a normal window, **USC Capture Output**. Any number of programs can then capture that window.
+
+**Setup:**
+1. Remove the card's *Video Capture Device* source from OBS (and close other apps using it).
+2. Open the 🎥 page and pick the device. Its modes are read once and listed; only these are ever used.
+3. Pick the output resolution (4K / 1440p / 1080p / 720p / match source) and FPS cap (144 / 120 / 100 / 60 / match source), then press **Start**.
+4. In OBS add **Game Capture** → Mode *Capture specific window* → Window `[UnifiedStreamChat.exe]: USC Capture Output`. In TikTok Studio, add a window capture of the same window.
+5. Keep the window open. It may sit behind other windows or on another monitor, but **not minimized**: Windows stops drawing minimized windows, so every capture would go black.
+
+**How it works:**
+
+```
+capture.html ──HTTP/SSE──> WebServer ──> CaptureRelay (worker thread + command queue)
+                                           ├─ MfVideoBackend  Media Foundation source reader (async)
+                                           │     device mode exactly as reported; NV12/YUY2 pass through
+                                           └─ D3DOutputWindow  top-level window + D3D11 flip swap chain
+                                                 GPU video processor: YUV→RGB, scaling, letterbox
+                                                 Present(DO_NOT_WAIT); preview JPEG only on request
+```
+
+**Pitfalls it avoids:**
+- **Device contention.** The device is opened once. Listing devices never opens them. Probing opens a device briefly and is never done on the device that is streaming. Errors name the cause: "in use by another app", "blocked by camera privacy", "disconnected".
+- **Unsupported modes.** Only modes the device reports are offered. *Auto* picks one that fits the output, in this order: fits the resolution, reaches the FPS, most detail, least wasted FPS, cheapest format. A saved mode the device no longer offers falls back to auto, with a note.
+- **Colour and CPU cost.** NV12 and YUY2 go straight to the GPU, where the video processor does BT.709/601 limited→full range conversion and scaling. Only MJPG/RGB modes use Windows' decoder, and the UI marks them "CPU decode".
+- **FPS.** The cap drops frames with a drift-free pacer (120 → 60 shows every other frame). A cap at or above the source rate does nothing. The page shows the measured capture FPS next to the output FPS.
+- **Black screen in Game Capture.**
+  - The window is a plain top-level window (no tool-window or layered style) drawn by a D3D11 flip-model swap chain, the path Game Capture hooks.
+  - The swap chain stays at the output resolution whatever size the window is, so a small window still captures in full resolution.
+  - The window gets black content immediately, before the first frame arrives.
+  - The page warns when the window is minimized.
+- **No idle cost.** When the relay is off, its thread sleeps until a command arrives. The preview (640×360 at about 5 fps) is made only while the page is visible and asks for it.
+- **No UI blocking.** Every API call only queues work. If the device loses its signal, the status turns *No signal*; if it is unplugged, the relay retries with back-off (5 → 30 s) and finds it again by name on another USB port. Closing the output window stops the relay and saves that choice.
+
 ### Google Translate / TTS
 Nothing is needed by default: the app uses Google's public Translate and Translate-TTS endpoints. For higher reliability and better voices (WaveNet/Neural2), create a Google Cloud API key with **Cloud Translation API** and **Cloud Text-to-Speech API** enabled, then paste it into *Translation → Google Cloud*. You can also set a voice name such as `ar-XA-Wavenet-B`.
 
@@ -263,9 +298,12 @@ src/net/                  HTTPS client + WebSocket client (WinHTTP on Windows,
 src/platforms/            TwitchClient, YouTubeClient, KickClient
 src/services/             Translator (Google Translate), TtsService (Google TTS),
                           AudioPlayer (miniaudio: output devices + native playback)
+src/capture/              video capture relay: CaptureTypes (mode choice, pacing - portable, tested),
+                          CaptureRelay (worker), MfVideoBackend (Media Foundation),
+                          D3DOutputWindow (D3D11 output window), CaptureStubs (non-Windows)
 src/desktop/              DesktopWindow (webview / WebView2 native window)
 src/server/               WebServer: static UI, REST API, SSE, OAuth callbacks
-web/                      dock UI (index.html, app.css, app.js) - no frameworks
+web/                      dock UI (index.html, app.css, app.js) + capture page (capture.*) - no frameworks
 tests/unit_tests.cpp      parser + TTS/translation decision tests (no network)
 ```
 
@@ -276,7 +314,7 @@ tests/unit_tests.cpp      parser + TTS/translation decision tests (no network)
 | GET | `/api/settings` | current settings |
 | POST | `/api/settings` | JSON merge-patch (needs header `X-USC: 1`) |
 | GET | `/api/status` | per-platform connection state |
-| GET | `/api/events` | SSE stream: `hello`, `chat`, `status`, `settings`, `clear` |
+| GET | `/api/events` | SSE stream: `hello`, `chat`, `status`, `settings`, `clear`, `speak`, `capture` |
 | GET | `/api/tts?text=&lang=` | MP3 audio |
 | POST | `/api/auth/{twitch,youtube}/login` / `logout` | OAuth |
 | GET | `/api/audio/devices` | output devices + saved choice |
@@ -284,5 +322,10 @@ tests/unit_tests.cpp      parser + TTS/translation decision tests (no network)
 | GET | `/api/links` | dock / overlay URLs |
 | POST | `/api/open?target=dock\|overlay\|overlayVoice` | open one of those links in the browser |
 | POST | `/api/test`, `/api/clear`, `/api/reconnect?platform=` | tools |
+| GET | `/api/capture/status` | relay state, chosen mode, measured FPS, window state (SSE event `capture`) |
+| GET | `/api/capture/devices` · POST `/api/capture/devices/refresh` | capture devices |
+| GET | `/api/capture/modes?device=` | the device's own modes (`probing: true` while being read) |
+| GET | `/api/capture/preview.jpg` | small preview frame (204 when there is none) |
+| POST | `/api/capture/start`, `/api/capture/stop` | turn the relay on / off (saved) |
 
 The server listens only on `127.0.0.1`. It rejects requests whose `Host` isn't localhost, and every POST needs the `X-USC` header. Together these block other websites and DNS-rebinding attacks from controlling the app.

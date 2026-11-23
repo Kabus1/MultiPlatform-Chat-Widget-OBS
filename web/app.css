@@ -71,6 +71,7 @@ button, input, select, textarea { font: inherit; color: inherit; }
   border: 0; background: transparent; cursor: pointer; border-radius: 6px;
   width: 28px; height: 28px; font-size: 16px; line-height: 1; color: var(--fg-dim);
 }
+a.icon-btn { display: inline-flex; align-items: center; justify-content: center; text-decoration: none; }
 .icon-btn:hover { background: var(--bg-3); color: var(--fg); }
 #tts-toggle.muted { color: var(--danger); }
 

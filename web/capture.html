@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Capture Relay</title>
+<link rel="stylesheet" href="/capture.css">
+</head>
+<body>
+<header class="bar">
+  <a class="back" href="/">&#x2190; Chat</a>
+  <div class="title">Video Capture Relay</div>
+  <span id="state-pill" class="pill">…</span>
+  <div class="spacer"></div>
+  <button id="start" class="primary">Start</button>
+  <button id="stop" class="danger" hidden>Stop</button>
+</header>
+
+<div class="layout">
+  <!-- Own settings sidebar: everything here is saved to settings.json "capture" -->
+  <aside class="side" aria-label="Relay settings">
+    <section>
+      <h3>Device</h3>
+      <label>Capture device
+        <select id="device"></select>
+      </label>
+      <div class="row">
+        <span id="device-presence" class="hint"></span>
+        <button id="refresh" class="small">Re-scan</button>
+      </div>
+    </section>
+
+    <section>
+      <h3>Capture mode <small>(what the device sends)</small></h3>
+      <label>Resolution / FPS / format
+        <select id="mode"></select>
+      </label>
+      <p id="mode-hint" class="hint">Only modes the device reports are listed - nothing unsupported is forced.</p>
+    </section>
+
+    <section>
+      <h3>Output <small>(what OBS / TikTok Studio captures)</small></h3>
+      <label>Resolution
+        <select id="out-res">
+          <option value="source">Match source</option>
+          <option value="2160p">4K (2160p)</option>
+          <option value="1440p">1440p</option>
+          <option value="1080p">1080p</option>
+          <option value="720p">720p</option>
+        </select>
+      </label>
+      <label>FPS cap
+        <select id="out-fps">
+          <option value="0">Match source</option>
+          <option value="144">144</option>
+          <option value="120">120</option>
+          <option value="100">100</option>
+          <option value="60">60</option>
+          <option value="50">50</option>
+          <option value="30">30</option>
+        </select>
+      </label>
+      <label class="check"><input type="checkbox" id="keep-aspect"> Keep aspect ratio (black bars)</label>
+    </section>
+
+    <section>
+      <h3>Window</h3>
+      <label>Window title (pick this in OBS)
+        <input id="title" type="text" maxlength="80">
+      </label>
+      <p class="hint">OBS: <b>Game Capture</b> &#x2192; Mode <i>Capture specific window</i> &#x2192; Window
+        <code id="title-code">[UnifiedStreamChat.exe]: USC Capture Output</code>.
+        Keep the window open (it may be behind other windows, but not minimized).</p>
+    </section>
+  </aside>
+
+  <main class="main">
+    <div id="banner" class="banner" hidden></div>
+
+    <div class="grid">
+      <div class="card">
+        <h4>Device provides</h4>
+        <dl>
+          <dt>Mode</dt><dd id="m-selected">–</dd>
+          <dt>Format to GPU</dt><dd id="m-delivered">–</dd>
+          <dt>Measured FPS</dt><dd id="m-capfps">–</dd>
+        </dl>
+      </div>
+      <div class="card">
+        <h4>You selected</h4>
+        <dl>
+          <dt>Output size</dt><dd id="m-output">–</dd>
+          <dt>FPS cap</dt><dd id="m-cap">–</dd>
+          <dt>Output FPS</dt><dd id="m-outfps">–</dd>
+        </dl>
+      </div>
+      <div class="card">
+        <h4>Output window</h4>
+        <dl>
+          <dt>Window</dt><dd id="w-state">–</dd>
+          <dt>Frames</dt><dd id="w-frames">–</dd>
+          <dt>Dropped</dt><dd id="w-dropped">–</dd>
+        </dl>
+      </div>
+    </div>
+
+    <div class="preview-wrap">
+      <div class="preview-head">
+        <h4>Preview</h4>
+        <label class="check"><input type="checkbox" id="preview-on" checked> Live preview (≈5 fps, low cost)</label>
+      </div>
+      <div class="preview">
+        <img id="preview" alt="">
+        <div id="preview-empty" class="empty">No picture yet</div>
+      </div>
+    </div>
+  </main>
+</div>
+<script src="/capture.js"></script>
+</body>
+</html>

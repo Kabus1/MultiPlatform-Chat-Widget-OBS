@@ -106,6 +106,7 @@ void WebServer::routes() {
     // --- static UI ---------------------------------------------------------
     if (!webDir_.empty()) {
         s.set_mount_point("/", webDir_);
+        s.Get("/capture", [](const httplib::Request&, httplib::Response& res) { res.set_redirect("/capture.html"); });
         LOG_INFO("server", "serving UI from ", webDir_);
     } else {
         for (const auto& a : assets::all()) {
@@ -119,6 +120,7 @@ void WebServer::routes() {
                 s.Get("/", handler);
                 s.Get("/overlay", handler);
             }
+            if (path == "/capture.html") s.Get("/capture", handler);
         }
     }
 
@@ -148,6 +150,8 @@ void WebServer::routes() {
         d["audio"] = cur["audio"]; // keep the chosen speaker across resets
         d["window"] = cur["window"];
         d["server"] = cur["server"];
+        d["capture"]["deviceId"] = cur["capture"]["deviceId"];
+        d["capture"]["deviceName"] = cur["capture"]["deviceName"];
         sendJson(res, app_.applySettings(d));
     });
 
@@ -259,6 +263,39 @@ void WebServer::routes() {
     s.Post("/api/kick/forget", [this](const httplib::Request&, httplib::Response& res) {
         app_.kickForgetChatroom();
         sendJson(res, {{"ok", true}});
+    });
+
+    // --- video capture relay (all calls return at once; work is queued) ------
+    s.Get("/api/capture/status", [this](const httplib::Request&, httplib::Response& res) {
+        sendJson(res, app_.capture().status());
+    });
+    s.Get("/api/capture/devices", [this](const httplib::Request&, httplib::Response& res) {
+        json st = app_.capture().status();
+        sendJson(res, {{"devices", st["devices"]}, {"error", st["devicesError"]}, {"enumerating", st["enumerating"]}});
+    });
+    s.Post("/api/capture/devices/refresh", [this](const httplib::Request&, httplib::Response& res) {
+        app_.capture().refreshDevices();
+        sendJson(res, {{"ok", true}});
+    });
+    s.Get("/api/capture/modes", [this](const httplib::Request& req, httplib::Response& res) {
+        std::string id = req.get_param_value("device");
+        if (id.empty()) return sendJson(res, {{"error", "missing ?device="}}, 400);
+        sendJson(res, app_.capture().modes(id));
+    });
+    s.Get("/api/capture/preview.jpg", [this](const httplib::Request&, httplib::Response& res) {
+        auto jpeg = app_.capture().preview(); // also keeps the preview alive for 3 s
+        res.set_header("Cache-Control", "no-store");
+        if (!jpeg) {
+            res.status = 204;
+            return;
+        }
+        res.set_content(*jpeg, "image/jpeg");
+    });
+    s.Post("/api/capture/start", [this](const httplib::Request&, httplib::Response& res) {
+        sendJson(res, app_.applySettings({{"capture", {{"enabled", true}}}})["capture"]);
+    });
+    s.Post("/api/capture/stop", [this](const httplib::Request&, httplib::Response& res) {
+        sendJson(res, app_.applySettings({{"capture", {{"enabled", false}}}})["capture"]);
     });
 
     s.Post("/api/reconnect", [this](const httplib::Request& req, httplib::Response& res) {
