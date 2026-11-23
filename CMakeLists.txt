@@ -164,6 +164,7 @@ add_library(usc_core STATIC
   src/platforms/YouTubeClient.cpp
   src/platforms/KickClient.cpp
   src/platforms/TikTokClient.cpp
+  src/integrations/ObsWatcher.cpp
   src/services/Translator.cpp
   src/services/TtsService.cpp
   src/services/AudioPlayer.cpp

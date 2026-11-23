@@ -166,7 +166,15 @@ How the login stays valid:
 2. Your **live** broadcast.
 3. A broadcast in preview, about to start, or the persistent "Stream now" one. Its chat opens before you go live and continues when you do. While on such a chat, the app re-checks every 60 s in case a different broadcast goes live.
 
-If nothing is found, the status is *waiting*, with the channel name and the reason, and it checks again every 15 s. **Reconnect** checks immediately, and also retries a failed login renewal right away. When a stream ends, the next one is searched for straight away.
+**API quota.** Every check costs YouTube Data API quota (10,000 units/day by default), so the app spends it only where it matters:
+- **Offline.** One `liveBroadcasts.list` call per check (the upcoming-broadcast query runs only on every third check). Checks back off: 1, 2, 4, 8 min, up to *When not live, check at most every* (10 min by default). That is about 150–300 calls a day at most, instead of about 11,500 with the old fixed 15 s checks.
+- **On demand.** **Reconnect**, or OBS starting to stream (see *OBS link*), switches to quick checks (every 15 s) for 3 minutes, then backs off again.
+- **Chat open, not live yet.** Read every 30 s instead of every 6 s, with one live check every 2 minutes.
+- **Live.** Polling follows YouTube's own `pollingIntervalMillis` (at least *Minimum poll interval while live*).
+- **Out of quota.** The app pauses for 30 minutes instead of retrying.
+- **Failed login renewals.** These back off from 30 s to 10 min, and no login link is opened or shown unless you click *Login* / *Switch account*.
+
+The status always names the channel and the reason. When a stream ends, the next one is searched for straight away.
 
 Quota note: each chat poll costs API quota units, and the default quota is 10,000 units per day. The app respects YouTube's `pollingIntervalMillis` and never polls faster than *Minimum poll interval* (6 s by default). Raise it for long streams, or ask Google for more quota.
 
@@ -196,13 +204,31 @@ Pusher error codes 4000–4099 (wrong key, app disabled, origin rejected) are sh
 This is needed once per channel. **Re-detect** forgets the saved ID. If Kick ever changes its Pusher key, update it under *Kick → Troubleshooting*.
 
 ### TikTok LIVE
-TikTok has no public API for reading LIVE chat. The app uses TikTok's internal *webcast* protocol, the same one the open-source TikTok-Live-Connector and TikTokLive projects use:
+Type the @username and turn it on. **No API keys, no TikTok developer account, no signing server.** The app joins the LIVE the same way a viewer's browser does:
 
-1. `tiktok.com/api-live/user/room` (fallback: the `@user/live` page) finds the room ID and whether the user is live. While the user is offline, the status is *waiting* and the app checks again every 60 s.
-2. A **signing server** turns the room ID into a signed WebSocket URL and cookies. TikTok requires anti-bot signatures that change often, so this step is delegated: the default is Euler Stream (`https://tiktok.eulerstream.com`), which has a free API key. Paste the key in *Connections → TikTok LIVE → Signing server*. Both protobuf and JSON responses are accepted.
-3. The WebSocket carries binary `WebcastPushFrame` protobufs with gzip payloads (decoded with a built-in protobuf reader and miniz). The app sends an enter-room frame, acknowledges frames that ask for it, and sends a heartbeat every 10 s. `WebcastChatMessage` events become chat messages. A `WebcastControlMessage` with "stream ended" switches back to *waiting*.
+1. **Live check.** One light request (`tiktok.com/api-live/user/room`) gives the room ID. The user is live when `liveRoom.status` or `user.status` is `2`.
+   - While offline, the status is *waiting*. Checks back off: 1, 2, 4 min, up to 5 min.
+   - **Reconnect**, or starting your stream in OBS (see *OBS link*), checks immediately.
+2. **Viewer session.** An anonymous `ttwid` cookie from `https://www.tiktok.com/`. TikTok sets it only on some requests, so it is retried up to 8 times.
+3. **WebSocket.** `wss://webcast-ws.tiktok.com/webcast/im/ws_proxy/ws_reuse_supplement/?room_id=…&identity=audience&…`, with no X-Bogus, msToken or signature, and `Cookie: ttwid`.
+4. **Frames.** Heartbeat and `im_enter_room`, then `WebcastPushFrame` protobufs with gzip payloads (decoded with a built-in protobuf reader and miniz), acknowledged when TikTok asks. `WebcastChatMessage` events become chat messages.
 
-The TikTok protocol changes without notice. The field numbers and endpoints are all in `src/platforms/TikTokClient.cpp`, so they can be updated in one place.
+**What the status means:**
+- `connecting`: checking live status, getting the viewer session, or joining the room.
+- `connected`: TikTok has actually answered after the app entered the room ("Listening to @user's LIVE (room …) – N chat messages so far"). An open socket alone doesn't count.
+- `waiting`: the user is not live, or the LIVE ended.
+- `error`: account not found, rate-limited, `DEVICE_BLOCKED` (a fresh viewer session is started automatically), or TikTok did not accept the connection within 30 s three times.
+- No data at all for 60 s triggers a reconnect.
+
+**Optional fallback.** A signing server (e.g. Euler Stream) is only used if you enter its API key under *Advanced*.
+
+The connection flow follows the open-source PirateTok connectors. TikTok can change it without notice; all endpoints and field numbers are in `src/platforms/TikTokClient.cpp`.
+
+### OBS link (event-driven checks)
+The app connects to OBS's own WebSocket server (OBS 28+, *Tools → WebSocket Server Settings*; default `127.0.0.1:4455`, password from *Show Connect Info*).
+- **It's local only.** It costs no API quota and contacts no streaming platform.
+- **It reacts to "stream started".** When OBS starts streaming (`StreamStateChanged`), YouTube and TikTok check right away and keep checking every 15 s for 3 minutes until the stream shows as live. Nothing needs to poll often while you are offline.
+- **It stays quiet when OBS is closed.** It retries every 30 s at most and only reports when its status changes.
 
 ### Google Translate / TTS
 Nothing is needed by default: the app uses Google's public Translate and Translate-TTS endpoints. For higher reliability and better voices (WaveNet/Neural2), create a Google Cloud API key with **Cloud Translation API** and **Cloud Text-to-Speech API** enabled, then paste it into *Translation → Google Cloud*. You can also set a voice name such as `ar-XA-Wavenet-B`.

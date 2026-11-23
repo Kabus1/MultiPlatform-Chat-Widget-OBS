@@ -79,7 +79,7 @@ namespace http {
 namespace {
 
 Response request(const wchar_t* method, const std::string& url, const Headers& headers, const std::string& body,
-                 const std::string& contentType, int timeoutSec) {
+                 const std::string& contentType, int timeoutSec, bool followRedirects = true) {
     using namespace winhttp;
     Response out;
     ParsedUrl u;
@@ -100,6 +100,10 @@ Response request(const wchar_t* method, const std::string& url, const Headers& h
     }
     int ms = timeoutSec * 1000;
     WinHttpSetTimeouts(req.get(), ms, ms, ms, ms);
+    if (!followRedirects) {
+        DWORD off = WINHTTP_DISABLE_REDIRECTS;
+        WinHttpSetOption(req.get(), WINHTTP_OPTION_DISABLE_FEATURE, &off, sizeof(off));
+    }
 
     std::string hdrs;
     for (const auto& [k, v] : headers) hdrs += k + ": " + v + "\r\n";
@@ -188,8 +192,8 @@ std::string buildQuery(const Params& params) {
     return q;
 }
 
-Response get(const std::string& url, const Headers& headers, int timeoutSec) {
-    return request(L"GET", url, withUserAgent(headers), {}, {}, timeoutSec);
+Response get(const std::string& url, const Headers& headers, int timeoutSec, bool followRedirects) {
+    return request(L"GET", url, withUserAgent(headers), {}, {}, timeoutSec, followRedirects);
 }
 
 Response postForm(const std::string& url, const Params& form, const Headers& headers, int timeoutSec) {

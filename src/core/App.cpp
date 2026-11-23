@@ -53,6 +53,38 @@ void App::start() {
     pipeline_.start();
     if (settings_.snapshot()["ui"].value("thirdPartyEmotes", true)) emotes_.loadGlobalAsync();
     for (const char* p : kPlatforms) restartPlatform(p);
+    restartObs();
+}
+
+void App::restartObs() {
+    std::lock_guard<std::mutex> lock(obsMutex_);
+    if (obs_) {
+        obs_->stop();
+        obs_.reset();
+    }
+    json cfg = settings_.snapshot()["obs"];
+    obsConfig_ = cfg;
+    if (!cfg.value("enabled", true)) {
+        setStatus("obs", "disabled", "");
+        return;
+    }
+    ObsWatcher::Config oc;
+    oc.host = cfg.value("host", "127.0.0.1");
+    oc.port = cfg.value("port", 4455);
+    oc.password = cfg.value("password", "");
+    obs_ = std::make_unique<ObsWatcher>(
+        oc, [this](bool streaming) { onObsStreamState(streaming); },
+        [this](const std::string& st, const std::string& d) { setStatus("obs", st, d); });
+    obs_->start();
+}
+
+void App::onObsStreamState(bool streaming) {
+    if (!streaming) return; // the platforms notice the end on their own
+    // Event-driven: a stream just started, so look for it now (YouTube /
+    // TikTok switch to quick checks for a few minutes) instead of polling.
+    std::lock_guard<std::mutex> lock(clientsMutex_);
+    for (const char* p : {"youtube", "tiktok"})
+        if (auto it = clients_.find(p); it != clients_.end()) it->second->checkNow();
 }
 
 void App::shutdown() {
@@ -62,6 +94,11 @@ void App::shutdown() {
         clients.swap(clients_);
     }
     for (auto& [name, c] : clients) c->stop();
+    {
+        std::lock_guard<std::mutex> lock(obsMutex_);
+        if (obs_) obs_->stop();
+        obs_.reset();
+    }
     pipeline_.stop();
     audio_.stop();
     hub_.closeAll();
@@ -189,7 +226,10 @@ std::optional<TokenSet> App::validToken(const std::string& platform, bool forceR
                 ? "Google rejected the app's client ID/secret (" + r.oauthError +
                       "). Your login is kept; check Settings > Connections > YouTube > Google client."
                 : "Could not renew the login (" + r.error + "). Your login is kept; retrying in 30s.";
-        refreshRetryAtMs_[platform] = util::nowMs() + 30000;
+        // 30s, 1, 2, 4, 8 min ... up to 10 min between attempts.
+        int failures = ++refreshFailures_[platform];
+        int64_t delay = std::min<int64_t>(int64_t(30000) << std::min(failures - 1, 5), 600000);
+        refreshRetryAtMs_[platform] = util::nowMs() + delay;
         return fallback();
     }
     r.tokens->login = t->login;
@@ -198,6 +238,7 @@ std::optional<TokenSet> App::validToken(const std::string& platform, bool forceR
     tokens_.set(platform, *r.tokens);
     authError_.erase(platform);
     refreshRetryAtMs_.erase(platform);
+    refreshFailures_.erase(platform);
     LOG_INFO("auth", platform, " token refreshed");
     return r.tokens;
 }
@@ -373,6 +414,12 @@ json App::applySettings(const json& patch) {
         }
         if (changed) restartPlatform(p);
     }
+    bool obsChanged;
+    {
+        std::lock_guard<std::mutex> lock(obsMutex_);
+        obsChanged = obsConfig_ != s["obs"];
+    }
+    if (obsChanged) restartObs();
     hub_.publish("settings", s);
     return s;
 }
@@ -424,7 +471,8 @@ void App::restartPlatform(const std::string& platform) {
         client = std::make_unique<YouTubeClient>(
             YouTubeClient::Config{cfg.value("videoId", ""), std::max(2000, cfg.value("minPollMs", 6000)),
                                   cfg.value("showBacklog", true), tokens,
-                                  [this] { return authProblem("youtube"); }},
+                                  [this] { return authProblem("youtube"); },
+                                  std::max(1, cfg.value("idleCheckMaxMinutes", 10)) * 60000},
             sink, status);
     } else if (platform == "kick") {
         KickClient::Config kc;

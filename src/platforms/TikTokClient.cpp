@@ -10,6 +10,7 @@
 #include <miniz.h>
 
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <regex>
 
@@ -35,14 +36,13 @@ constexpr uint32_t kCommonMsgId = 2, kCommonCreateTime = 4;
 constexpr uint32_t kUserId = 1, kUserNickname = 3, kUserUniqueId = 38;
 // WebcastControlMessage
 constexpr uint32_t kControlAction = 2;
-constexpr uint64_t kControlStreamEnded = 3;
+constexpr uint64_t kControlStreamEnded = 3, kControlStreamEndedBan = 4;
 // Map entry
 constexpr uint32_t kKey = 1, kValue = 2;
 } // namespace field
 
 namespace {
 
-const char* kDefaultPushServer = "wss://webcast-ws.tiktok.com/webcast/im/push/v2/";
 
 std::string str(std::string_view v) { return std::string(v.data(), v.size()); }
 
@@ -192,7 +192,8 @@ bool TikTokClient::isStreamEnd(std::string_view payload) {
     pb::Reader r(payload);
     pb::Field x;
     while (r.next(x))
-        if (x.number == field::kControlAction && x.wire == pb::Varint) return x.varint == field::kControlStreamEnded;
+        if (x.number == field::kControlAction && x.wire == pb::Varint)
+            return x.varint == field::kControlStreamEnded || x.varint == field::kControlStreamEndedBan;
     return false;
 }
 
@@ -200,16 +201,33 @@ TikTokClient::RoomInfo TikTokClient::parseRoomInfo(const std::string& body) {
     RoomInfo info;
     json j = json::parse(body, nullptr, false);
     if (!j.is_discarded() && j.is_object()) {
+        const int64_t code = j.contains("statusCode") && j["statusCode"].is_number() ? j["statusCode"].get<int64_t>() : 0;
+        if (code == 19881007) { // user_not_found
+            info.notFound = true;
+            info.error = "account not found";
+            return info;
+        }
+        if (code != 0) {
+            info.error = "TikTok answered statusCode " + std::to_string(code) +
+                         (j.contains("message") && j["message"].is_string() ? " (" + j["message"].get<std::string>() + ")" : "");
+            return info;
+        }
         const json data = j.value("data", json::object());
         const json user = data.is_object() ? data.value("user", json::object()) : json::object();
-        if (user.is_object() && user.contains("roomId")) {
+        if (!user.is_object() || user.empty()) {
+            info.error = "unexpected answer (no user data)";
+            return info;
+        }
+        info.found = true;
+        if (user.contains("roomId")) {
             const json& id = user["roomId"];
             info.roomId = id.is_string() ? id.get<std::string>() : id.is_number() ? std::to_string(id.get<uint64_t>()) : "";
-            info.found = true;
-            int status = user.value("status", 0);
-            if (data.contains("liveRoom") && data["liveRoom"].is_object()) status = data["liveRoom"].value("status", status);
-            info.live = status == 2 && !info.roomId.empty() && info.roomId != "0";
         }
+        // Live when either the user or the room reports status 2.
+        const int userStatus = user.value("status", 0);
+        int roomStatus = 0;
+        if (data.contains("liveRoom") && data["liveRoom"].is_object()) roomStatus = data["liveRoom"].value("status", 0);
+        info.live = (userStatus == 2 || roomStatus == 2) && !info.roomId.empty() && info.roomId != "0";
         return info;
     }
     // HTML fallback (tiktok.com/@user/live): embedded state JSON.
@@ -219,8 +237,10 @@ TikTokClient::RoomInfo TikTokClient::parseRoomInfo(const std::string& body) {
     if (std::regex_search(body, m, roomRe)) {
         info.found = true;
         info.roomId = m[1];
-        std::smatch s;
-        info.live = std::regex_search(body, s, statusRe) ? s[1] == "2" : info.roomId != "0";
+        std::smatch st;
+        info.live = std::regex_search(body, st, statusRe) ? st[1] == "2" : info.roomId != "0";
+    } else {
+        info.error = "could not read the live status";
     }
     return info;
 }
@@ -267,6 +287,75 @@ std::string TikTokClient::enterRoomFrame(const std::string& roomId) {
 }
 
 // --------------------------------------------------------------------------
+// Viewer-style connection helpers
+// --------------------------------------------------------------------------
+
+namespace {
+const int kBurstRecheckMs = 15000;   // after Reconnect / OBS "stream started"
+const int kBurstDurationMs = 180000;
+const int kIdleFirstMs = 60000;
+const int kHeartbeatMs = 10000;
+const int kStaleMs = 60000;          // no frame at all for this long: reconnect
+const int kJoinTimeoutMs = 30000;    // socket open but TikTok never answered
+
+const char* kDirectHost = "webcast-ws.tiktok.com";
+} // namespace
+
+std::string TikTokClient::normalizeUser(const std::string& input) {
+    std::string u = util::trim(input);
+    if (auto p = u.find("tiktok.com/"); p != std::string::npos) u = u.substr(p + 11);
+    if (!u.empty() && u[0] == '@') u.erase(0, 1);
+    if (auto p = u.find_first_of("/?# "); p != std::string::npos) u = u.substr(0, p);
+    return util::toLower(u);
+}
+
+std::string TikTokClient::extractTtwid(const std::vector<std::string>& setCookies) {
+    for (const auto& line : setCookies) {
+        std::string l = util::trim(line);
+        if (l.rfind("ttwid=", 0) != 0) continue;
+        std::string v = util::trim(l.substr(6, l.find(';') == std::string::npos ? std::string::npos : l.find(';') - 6));
+        if (!v.empty()) return v;
+    }
+    return {};
+}
+
+std::string TikTokClient::buildDirectWsUrl(const std::string& roomId, double lastRtt) {
+    char rtt[32];
+    std::snprintf(rtt, sizeof(rtt), "%.3f", lastRtt);
+    http::Params q = {
+        {"version_code", "180800"},
+        {"device_platform", "web"},
+        {"cookie_enabled", "true"},
+        {"screen_width", "1920"},
+        {"screen_height", "1080"},
+        {"browser_language", "en-US"},
+        {"browser_platform", "Win32"},
+        {"browser_name", "Mozilla"},
+        {"browser_version", "5.0 (Windows NT 10.0; Win64; x64)"},
+        {"browser_online", "true"},
+        {"tz_name", "UTC"},
+        {"app_name", "tiktok_web"},
+        {"sup_ws_ds_opt", "1"},
+        {"update_version_code", "2.0.0"},
+        {"compress", "gzip"},
+        {"webcast_language", "en"},
+        {"ws_direct", "1"},
+        {"aid", "1988"},
+        {"live_id", "12"},
+        {"app_language", "en"},
+        {"client_enter", "1"},
+        {"room_id", roomId},
+        {"identity", "audience"},
+        {"history_comment_count", "6"},
+        {"last_rtt", rtt},
+        {"heartbeat_duration", std::to_string(kHeartbeatMs)},
+        {"resp_content_type", "protobuf"},
+        {"did_rule", "3"},
+    };
+    return std::string("wss://") + kDirectHost + "/webcast/im/ws_proxy/ws_reuse_supplement/?" + http::buildQuery(q);
+}
+
+// --------------------------------------------------------------------------
 // Client
 // --------------------------------------------------------------------------
 
@@ -293,35 +382,79 @@ void TikTokClient::stop() {
     onStatus_("disconnected", "");
 }
 
+bool TikTokClient::checkNow() {
+    if (!running_) return false;
+    burstUntilMs_ = util::nowMs() + kBurstDurationMs;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        wake_ = true;
+    }
+    cv_.notify_all();
+    return true;
+}
+
 bool TikTokClient::sleepFor(int ms) {
     std::unique_lock<std::mutex> lock(mutex_);
-    cv_.wait_for(lock, std::chrono::milliseconds(ms), [&] { return !running_.load(); });
+    cv_.wait_for(lock, std::chrono::milliseconds(ms), [&] { return !running_.load() || wake_.load(); });
+    wake_ = false;
     return running_;
 }
 
-TikTokClient::RoomInfo TikTokClient::resolveRoom(std::string& error) {
-    std::string user = util::trim(cfg_.username);
-    if (auto p = user.find("tiktok.com/"); p != std::string::npos) user = user.substr(p + 11);
-    if (!user.empty() && user[0] == '@') user.erase(0, 1);
-    if (auto p = user.find_first_of("/?# "); p != std::string::npos) user = user.substr(0, p);
+bool TikTokClient::inBurst() const { return util::nowMs() < burstUntilMs_; }
 
-    const http::Headers headers = {{"Accept-Language", "en-US,en;q=0.9"}, {"Referer", "https://www.tiktok.com/"}};
-    auto r = http::get("https://www.tiktok.com/api-live/user/room/?" +
+int TikTokClient::nextIdleDelay() {
+    if (inBurst()) return kBurstRecheckMs;
+    int d = idleDelayMs_;
+    idleDelayMs_ = std::min(idleDelayMs_ * 2, std::max(kIdleFirstMs, cfg_.idleMaxMs));
+    return d;
+}
+
+TikTokClient::RoomInfo TikTokClient::resolveRoom() {
+    const http::Headers headers = {{"Accept-Language", "en-US,en;q=0.9"}};
+    auto r = http::get("https://www.tiktok.com/api-live/user/room?" +
                            http::buildQuery({{"aid", "1988"}, {"app_name", "tiktok_web"}, {"device_platform", "web_pc"},
-                                             {"app_language", "en"}, {"browser_language", "en-US"},
-                                             {"sourceType", "54"}, {"uniqueId", user}}),
+                                             {"app_language", "en"}, {"browser_language", "en-US"}, {"region", "US"},
+                                             {"user_is_login", "false"}, {"sourceType", "54"},
+                                             {"staleTime", "600000"}, {"uniqueId", user_}}),
                        headers, 10);
-    cookies_ = mergeCookies(cookies_, r.headerValues("Set-Cookie"));
-    RoomInfo info = r.ok() ? parseRoomInfo(r.body) : RoomInfo{};
-    if (!info.found) {
-        auto page = http::get("https://www.tiktok.com/@" + util::urlEncode(user) + "/live", headers, 10);
-        cookies_ = mergeCookies(cookies_, page.headerValues("Set-Cookie"));
-        if (page.ok()) info = parseRoomInfo(page.body);
-        if (!info.found)
-            error = page.status == 0 ? page.error
-                                     : "could not find @" + user + " (HTTP " + std::to_string(page.status) + ")";
+    RoomInfo info;
+    if (r.status == 403 || r.status == 429) {
+        info.blocked = true;
+        info.error = "TikTok is rate-limiting the live check (HTTP " + std::to_string(r.status) + ")";
+        return info;
+    }
+    if (r.status == 0) {
+        info.error = "no connection to TikTok (" + r.error + ")";
+        return info;
+    }
+    if (r.ok()) info = parseRoomInfo(r.body);
+    if (!info.found && !info.notFound) {
+        // Fallback: the public live page embeds the same state.
+        auto page = http::get("https://www.tiktok.com/@" + util::urlEncode(user_) + "/live", headers, 10);
+        if (page.ok()) {
+            RoomInfo fromPage = parseRoomInfo(page.body);
+            if (fromPage.found) info = fromPage;
+        }
+        if (!info.found && info.error.empty()) info.error = "HTTP " + std::to_string(r.status);
     }
     return info;
+}
+
+std::string TikTokClient::fetchTtwid(std::string& error) {
+    // TikTok sets the anonymous ttwid cookie on only some anonymous requests:
+    // retry a few times. Redirects are not followed, the cookie is on the first answer.
+    for (int attempt = 0; attempt < 8 && running_; ++attempt) {
+        auto r = http::get("https://www.tiktok.com/", {{"Accept-Language", "en-US,en;q=0.9"}}, 10, false);
+        if (r.status == 0) {
+            error = "no connection to tiktok.com (" + r.error + ")";
+            return {};
+        }
+        std::string v = extractTtwid(r.headerValues("Set-Cookie"));
+        if (!v.empty()) return v;
+        std::this_thread::sleep_for(std::chrono::milliseconds(750));
+    }
+    error = "TikTok did not hand out a session cookie (ttwid) after 8 tries";
+    return {};
 }
 
 std::optional<TikTokClient::ConnectInfo> TikTokClient::fetchConnect(const std::string& roomId, std::string& error) {
@@ -331,20 +464,11 @@ std::optional<TikTokClient::ConnectInfo> TikTokClient::fetchConnect(const std::s
         error = "no signing server configured";
         return std::nullopt;
     }
-    http::Params q = {{"client", "ttlive-node"}, {"room_id", roomId}, {"unique_id", cfg_.username}};
+    http::Params q = {{"client", "ttlive-node"}, {"room_id", roomId}, {"unique_id", user_}};
     if (!cfg_.apiKey.empty()) q.push_back({"apiKey", cfg_.apiKey});
     http::Headers h;
     if (!cfg_.apiKey.empty()) h.push_back({"x-api-key", cfg_.apiKey});
     auto r = http::get(server + "/webcast/fetch?" + http::buildQuery(q), h, 15);
-    if (r.status == 401 || r.status == 403) {
-        error = "signing server refused the request (HTTP " + std::to_string(r.status) +
-                ") - check the TikTok API key in Settings";
-        return std::nullopt;
-    }
-    if (r.status == 429) {
-        error = "signing server rate limit reached (HTTP 429)";
-        return std::nullopt;
-    }
     if (!r.ok()) {
         error = r.status == 0 ? r.error : "signing server HTTP " + std::to_string(r.status);
         return std::nullopt;
@@ -352,7 +476,6 @@ std::optional<TikTokClient::ConnectInfo> TikTokClient::fetchConnect(const std::s
     for (const char* name : {"x-set-tt-cookie", "Set-Cookie"}) {
         std::vector<std::string> lines;
         for (const auto& v : r.headerValues(name)) {
-            // x-set-tt-cookie packs several cookies into one "a=b; c=d" value.
             size_t start = 0;
             while (start < v.size()) {
                 size_t end = v.find(';', start);
@@ -363,16 +486,12 @@ std::optional<TikTokClient::ConnectInfo> TikTokClient::fetchConnect(const std::s
         }
         cookies_ = mergeCookies(cookies_, lines);
     }
-
     ConnectInfo info;
     info.cookies = cookies_;
-    // Some signing servers answer with JSON, others with the raw protobuf.
     json j = json::parse(r.body, nullptr, false);
     if (!j.is_discarded() && j.is_object()) {
         for (const char* k : {"wsUrl", "ws_url", "websocketUrl", "url"})
             if (j.contains(k) && j[k].is_string()) info.wsUrl = j[k].get<std::string>();
-        for (const char* k : {"cookies", "cookie"})
-            if (j.contains(k) && j[k].is_string()) info.cookies = mergeCookies(cookies_, {j[k].get<std::string>()});
         if (info.wsUrl.empty()) {
             error = "signing server response has no WebSocket URL";
             return std::nullopt;
@@ -384,25 +503,21 @@ std::optional<TikTokClient::ConnectInfo> TikTokClient::fetchConnect(const std::s
         error = "unrecognised signing server response";
         return std::nullopt;
     }
-    http::Params params = {
-        {"aid", "1988"}, {"app_language", "en-US"}, {"app_name", "tiktok_web"}, {"browser_language", "en-US"},
-        {"browser_name", "Mozilla"}, {"browser_online", "true"}, {"browser_platform", "Win32"},
-        {"cookie_enabled", "true"}, {"device_platform", "web"}, {"did_rule", "3"}, {"fetch_rule", "1"},
-        {"identity", "audience"}, {"live_id", "12"}, {"resp_content_type", "protobuf"}, {"version_code", "180800"},
-        {"webcast_sdk_version", "1.3.0"}, {"update_version_code", "1.3.0"}, {"compress", "gzip"},
-        {"heartbeatDuration", "0"}, {"sup_ws_ds_opt", "1"}, {"room_id", roomId}, {"cursor", fetch->cursor},
-        {"internal_ext", fetch->internalExt},
-    };
-    for (const auto& [k, v] : fetch->routeParams) params.push_back({k, v});
-    info.wsUrl = (fetch->pushServer.empty() ? std::string(kDefaultPushServer) : fetch->pushServer) + "?" +
-                 http::buildQuery(params);
+    std::string url = buildDirectWsUrl(roomId, 150.0);
+    url += "&" + http::buildQuery({{"cursor", fetch->cursor}, {"internal_ext", fetch->internalExt}});
+    for (const auto& [k, v] : fetch->routeParams) url += "&" + http::buildQuery({{k, v}});
+    info.wsUrl = url;
     return info;
 }
 
 void TikTokClient::onFrame(const std::string& data) {
     lastFrameMs_ = util::nowMs();
     auto frame = parsePushFrame(data);
-    if (!frame || frame->payloadType != "msg") return;
+    if (!frame) return;
+    // Any answer after im_enter_room proves TikTok let us into the room.
+    if (!joined_.exchange(true))
+        onStatus_("connected", "Listening to @" + user_ + "'s LIVE (room " + roomId_ + ")");
+    if (frame->payloadType != "msg") return; // hb / im_enter_room_resp
     std::string payload = std::move(frame->payload);
     std::string inflated;
     if (gunzip(payload, inflated)) payload = std::move(inflated);
@@ -410,12 +525,15 @@ void TikTokClient::onFrame(const std::string& data) {
     if (!res) return;
     for (const auto& [method, body] : res->messages) {
         if (method == "WebcastChatMessage") {
-            if (auto m = parseChatMessage(body)) onMessage_(std::move(*m));
+            if (auto m = parseChatMessage(body)) {
+                ++chatCount_;
+                onMessage_(std::move(*m));
+            }
         } else if (method == "WebcastControlMessage" && isStreamEnd(body)) {
             streamEnded_ = true;
         }
     }
-    if (res->needsAck) {
+    if (res->needsAck && !res->internalExt.empty()) {
         PushFrame ack;
         ack.logId = frame->logId;
         ack.payloadEncoding = "pb";
@@ -427,74 +545,157 @@ void TikTokClient::onFrame(const std::string& data) {
 }
 
 void TikTokClient::run() {
-    const std::string handle = "@" + util::trim(cfg_.username);
-    if (util::trim(cfg_.username).empty()) {
+    user_ = normalizeUser(cfg_.username);
+    if (user_.empty()) {
         onStatus_("error", "Enter the TikTok username in Settings > Connections");
         return;
     }
+    const std::string handle = "@" + user_;
+    const bool useSigner = !util::trim(cfg_.apiKey).empty() && !util::trim(cfg_.signServer).empty();
+    burstUntilMs_ = util::nowMs() + kBurstDurationMs;
+
+    auto waitText = [](int ms) {
+        return ms >= 60000 ? std::to_string(ms / 60000) + " min" : std::to_string(ms / 1000) + "s";
+    };
+
     while (running_) {
-        onStatus_("connecting", "Looking up " + handle + "...");
-        std::string error;
-        RoomInfo room = resolveRoom(error);
+        // ---- 1. Is the user live? (one light request) -------------------
+        onStatus_("connecting", "Checking whether " + handle + " is live...");
+        RoomInfo room = resolveRoom();
+        if (room.notFound) {
+            onStatus_("error", "TikTok account " + handle + " does not exist - check the username");
+            if (!sleepFor(600000)) return;
+            continue;
+        }
         if (!room.found) {
-            onStatus_("error", "TikTok: " + error + " - retrying in 60s");
-            if (!sleepFor(60000)) return;
+            int wait = std::max(nextIdleDelay(), room.blocked ? 120000 : 0);
+            onStatus_("error", "Could not check " + handle + ": " + room.error + " - retrying in " + waitText(wait));
+            if (!sleepFor(wait)) return;
             continue;
         }
         if (!room.live) {
-            onStatus_("waiting", handle + " is not live - checking again in 60s");
-            if (!sleepFor(60000)) return;
+            int wait = nextIdleDelay();
+            onStatus_("waiting", handle + " is not live. Next check in " + waitText(wait) +
+                                     " - press Reconnect (or start streaming in OBS) to check now.");
+            if (!sleepFor(wait)) return;
             continue;
         }
+        idleDelayMs_ = kIdleFirstMs;
         roomId_ = room.roomId;
-        auto info = fetchConnect(roomId_, error);
-        if (!info) {
-            onStatus_("error", "TikTok: " + error);
-            if (!sleepFor(60000)) return;
-            continue;
+
+        // ---- 2. Connection details (no keys needed) ---------------------
+        std::string url, cookie;
+        if (useSigner) {
+            std::string error;
+            auto info = fetchConnect(roomId_, error);
+            if (!info) {
+                onStatus_("error", "Signing server failed (" + error + ") - using the direct connection instead");
+            } else {
+                url = info->wsUrl;
+                cookie = info->cookies;
+            }
+        }
+        if (url.empty()) {
+            if (ttwid_.empty() || needFreshTtwid_.exchange(false)) {
+                onStatus_("connecting", handle + " is live - getting a viewer session...");
+                std::string error;
+                ttwid_ = fetchTtwid(error);
+                if (ttwid_.empty()) {
+                    onStatus_("error", "Could not start a TikTok viewer session: " + error + " - retrying in 1 min");
+                    if (!sleepFor(60000)) return;
+                    continue;
+                }
+            }
+            url = buildDirectWsUrl(roomId_, 100.0 + (util::nowMs() % 100000) / 1000.0);
+            cookie = "ttwid=" + ttwid_;
         }
 
+        // ---- 3. WebSocket ------------------------------------------------
+        joined_ = false;
         streamEnded_ = false;
+        chatCount_ = 0;
         lastFrameMs_ = util::nowMs();
+        int64_t connectStartMs = util::nowMs();
         WebSocketClient::Callbacks cb;
         cb.onOpen = [this, handle] {
+            joined_ = false;
+            lastFrameMs_ = util::nowMs();
             std::lock_guard<std::mutex> lock(mutex_);
-            if (ws_) ws_->sendBinary(enterRoomFrame(roomId_));
-            onStatus_("connected", handle + " (live)");
+            if (ws_) {
+                ws_->sendBinary(heartbeatFrame(roomId_));
+                ws_->sendBinary(enterRoomFrame(roomId_));
+            }
+            onStatus_("connecting", "Joining " + handle + "'s LIVE (room " + roomId_ + ")...");
         };
         cb.onBinary = [this](const std::string& d) { onFrame(d); };
         cb.onClose = [this](int code, const std::string& reason) {
-            if (running_) onStatus_("connecting", "Disconnected (" + std::to_string(code) + (reason.empty() ? "" : " " + reason) + "), reconnecting...");
+            joined_ = false;
+            if (running_)
+                onStatus_("connecting", "TikTok closed the connection (" + std::to_string(code) +
+                                            (reason.empty() ? "" : " " + reason) + ") - reconnecting...");
         };
-        cb.onError = [this](const std::string& reason) { onStatus_("error", "TikTok connection error: " + reason); };
+        cb.onError = [this](const std::string& reason) {
+            joined_ = false;
+            if (reason.find("DEVICE_BLOCKED") != std::string::npos) {
+                needFreshTtwid_ = true; // the watchdog rebuilds the connection with a new session
+                onStatus_("error", "TikTok flagged the viewer session (DEVICE_BLOCKED) - starting a new one");
+            } else {
+                onStatus_("error", "TikTok connection failed: " + reason);
+            }
+        };
         WebSocketClient::Options opt;
-        opt.headers = {{"Cookie", info->cookies},
-                       {"User-Agent", http::browserUserAgent()},
-                       {"Origin", "https://www.tiktok.com"}};
-        // Each reconnect needs a fresh cursor / signature.
-        opt.urlProvider = [this]() -> std::string {
-            std::string err;
-            auto fresh = fetchConnect(roomId_, err);
-            return fresh ? fresh->wsUrl : std::string();
-        };
+        opt.headers = {{"User-Agent", http::browserUserAgent()},
+                       {"Cookie", cookie},
+                       {"Origin", "https://www.tiktok.com"},
+                       {"Referer", "https://www.tiktok.com/"},
+                       {"Accept-Language", "en-US,en;q=0.9"},
+                       {"Cache-Control", "no-cache"}};
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            ws_ = std::make_unique<WebSocketClient>(info->wsUrl, std::move(cb), std::move(opt));
+            ws_ = std::make_unique<WebSocketClient>(url, std::move(cb), std::move(opt));
             ws_->start();
         }
 
-        // Heartbeat + liveness watchdog.
-        while (sleepFor(10000)) {
+        // ---- 4. Heartbeat + watchdog: are we really listening? -----------
+        int joinFailures = 0;
+        uint64_t reportedChats = 0;
+        while (sleepFor(kHeartbeatMs)) {
             {
                 std::lock_guard<std::mutex> lock(mutex_);
                 if (ws_) ws_->sendBinary(heartbeatFrame(roomId_));
             }
-            if (streamEnded_) break;
-            if (util::nowMs() - lastFrameMs_ > 90000) {
-                LOG_WARN("tiktok", "no data for 90s, reconnecting");
-                lastFrameMs_ = util::nowMs();
-                std::lock_guard<std::mutex> lock(mutex_);
-                if (ws_) ws_->reconnect();
+            if (streamEnded_ || needFreshTtwid_) break;
+            const int64_t now = util::nowMs();
+            if (joined_) {
+                joinFailures = 0;
+                connectStartMs = now;
+                if (now - lastFrameMs_ > kStaleMs) {
+                    LOG_WARN("tiktok", "no data for 60s, reconnecting");
+                    onStatus_("connecting", "No data from TikTok for 60s - reconnecting...");
+                    joined_ = false;
+                    lastFrameMs_ = now;
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    if (ws_) ws_->reconnect();
+                } else if (chatCount_ != reportedChats) {
+                    reportedChats = chatCount_;
+                    onStatus_("connected", "Listening to " + handle + "'s LIVE (room " + roomId_ + ") - " +
+                                               std::to_string(reportedChats) + " chat message(s) so far");
+                }
+            } else if (now - connectStartMs > kJoinTimeoutMs) {
+                // Socket up (or retrying) but TikTok never let us in: is the
+                // stream still on? If yes, try again with a fresh session.
+                connectStartMs = now;
+                RoomInfo again = resolveRoom();
+                if (again.found && !again.live) {
+                    streamEnded_ = true;
+                    break;
+                }
+                if (++joinFailures >= 3) {
+                    onStatus_("error", "TikTok did not accept the connection to room " + roomId_ +
+                                           " - retrying with a new viewer session");
+                    needFreshTtwid_ = true;
+                    break;
+                }
             }
         }
         std::unique_ptr<WebSocketClient> old;
@@ -504,8 +705,11 @@ void TikTokClient::run() {
         }
         if (old) old->stop();
         if (!running_) return;
-        onStatus_("waiting", handle + "'s live stream ended - checking again in 60s");
-        if (!sleepFor(60000)) return;
+        if (streamEnded_) {
+            idleDelayMs_ = kIdleFirstMs;
+            onStatus_("waiting", handle + "'s LIVE ended - checking again in 1 min");
+            if (!sleepFor(kIdleFirstMs)) return;
+        }
     }
 }
 

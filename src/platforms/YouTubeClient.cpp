@@ -14,8 +14,12 @@ using nlohmann::json;
 namespace {
 
 const char* kApi = "https://www.googleapis.com/youtube/v3";
-const int kWaitingRecheckMs = 15000;   // no stream found: look again after this
-const int kUpcomingRecheckMs = 60000;  // chat open but not live: re-detect (a different broadcast may go live)
+const int kBurstRecheckMs = 15000;       // right after Reconnect / OBS "stream started"
+const int kBurstDurationMs = 180000;     // how long the fast checks last
+const int kIdleFirstMs = 60000;          // first idle wait, then doubles up to idleMaxMs
+const int kUpcomingChatPollMs = 30000;   // chat open but not live: read it slowly
+const int kUpcomingRecheckMs = 120000;   // ... and check whether it went live this often
+const int kAuthRetryMs = 60000;          // not logged in / login problem
 
 std::string apiReason(const http::Response& r) {
     if (r.status == 0) return "network: " + r.error;
@@ -61,8 +65,18 @@ void YouTubeClient::stop() {
     onStatus_("disconnected", "");
 }
 
+bool YouTubeClient::inBurst() const { return util::nowMs() < burstUntilMs_; }
+
+int YouTubeClient::nextIdleDelay() {
+    if (inBurst()) return kBurstRecheckMs;
+    int d = idleDelayMs_;
+    idleDelayMs_ = std::min(idleDelayMs_ * 2, std::max(kIdleFirstMs, cfg_.idleMaxMs));
+    return d;
+}
+
 bool YouTubeClient::checkNow() {
     if (!running_) return false;
+    burstUntilMs_ = util::nowMs() + kBurstDurationMs;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         wake_ = true;
@@ -132,7 +146,8 @@ std::string YouTubeClient::explainApiError(const std::string& reason, const std:
     return "YouTube API error: " + reason;
 }
 
-YouTubeClient::Detection YouTubeClient::detect(const std::string& accessToken, const std::string& channel) {
+YouTubeClient::Detection YouTubeClient::detect(const std::string& accessToken, const std::string& channel,
+                                               bool includeUpcoming) {
     Detection d;
     const http::Headers auth = {{"Authorization", "Bearer " + accessToken}};
     auto fail = [&](const http::Response& r) {
@@ -178,6 +193,12 @@ YouTubeClient::Detection YouTubeClient::detect(const std::string& accessToken, c
     if ((d.broadcast = pickBroadcast(json::parse(active.body, nullptr, false), true))) return d;
 
     // 3. About to go live / in preview / "Stream now" persistent broadcast.
+    //    Skipped on most idle checks: it is a second API call.
+    if (!includeUpcoming) {
+        d.notFound = videoNote + "No live stream on " +
+                     (channel.empty() ? std::string("the logged-in channel") : "channel '" + channel + "'") + ".";
+        return d;
+    }
     auto upcoming = http::get(std::string(kApi) + "/liveBroadcasts?" +
                                   http::buildQuery({{"part", "snippet,status"}, {"broadcastStatus", "upcoming"},
                                                     {"broadcastType", "all"}, {"maxResults", "25"}}),
@@ -193,40 +214,49 @@ YouTubeClient::Detection YouTubeClient::detect(const std::string& accessToken, c
 }
 
 void YouTubeClient::run() {
+    burstUntilMs_ = util::nowMs() + kBurstDurationMs; // first minutes after start: check quickly
     while (running_) {
         auto token = cfg_.tokens(false);
         if (!token) {
+            // No API calls at all while there is no login.
             onStatus_("error", authMessage());
-            if (!sleepFor(kWaitingRecheckMs)) return;
+            if (!sleepFor(kAuthRetryMs)) return;
             continue;
         }
         const std::string channel = token->login;
 
+        const bool upcomingToo = inBurst() || idleChecks_ % 3 == 0;
+        ++idleChecks_;
         onStatus_("connecting", "Checking " + (channel.empty() ? std::string("your channel") : "'" + channel + "'") +
                                     " for a live stream...");
-        Detection det = detect(token->accessToken, channel);
+        Detection det = detect(token->accessToken, channel, upcomingToo);
         if (det.httpStatus == 401) {
             // Access token expired early or was revoked: renew it once, re-check.
             token = cfg_.tokens(true);
             if (!token) {
                 onStatus_("error", authMessage());
-                if (!sleepFor(kWaitingRecheckMs)) return;
+                if (!sleepFor(kAuthRetryMs)) return;
                 continue;
             }
-            det = detect(token->accessToken, channel);
+            det = detect(token->accessToken, channel, upcomingToo);
         }
         if (det.httpStatus < 200 || det.httpStatus >= 300) {
             LOG_WARN("youtube", "detection failed: HTTP ", det.httpStatus, " ", det.apiReason);
             onStatus_("error", det.httpStatus == 401 ? authMessage() : explainApiError(det.apiReason, channel));
-            int pause = det.apiReason == "quotaExceeded" || det.apiReason == "dailyLimitExceeded" ? 300000 : 30000;
-            if (!sleepFor(pause)) return;
+            bool quota = det.apiReason == "quotaExceeded" || det.apiReason == "dailyLimitExceeded";
+            if (!sleepFor(quota ? 1800000 : nextIdleDelay())) return;
             continue;
         }
         if (!det.broadcast) {
-            onStatus_("waiting", det.notFound + " Checking again every 15s (Reconnect checks now).");
-            if (!sleepFor(kWaitingRecheckMs)) return;
+            int wait = nextIdleDelay();
+            onStatus_("waiting", det.notFound + " Next check in " +
+                                     (wait >= 60000 ? std::to_string(wait / 60000) + " min" : std::to_string(wait / 1000) + "s") +
+                                     " - press Reconnect (or start streaming in OBS) to check now.");
+            if (!sleepFor(wait)) return;
             continue;
         }
+        idleDelayMs_ = kIdleFirstMs; // found something: next idle period starts short again
+        idleChecks_ = 0;
 
         Broadcast b = *det.broadcast;
         auto announce = [&](const Broadcast& br) {
@@ -246,11 +276,12 @@ void YouTubeClient::run() {
                 onStatus_("error", authMessage());
                 break;
             }
-            // While waiting in an upcoming broadcast's chat, keep checking: the
-            // stream may start on a different broadcast ("Stream now" vs event).
-            if (!b.live && util::nowMs() - lastDetectMs > kUpcomingRecheckMs) {
+            // Not live yet: one cheap check every 2 min (sooner during a burst,
+            // e.g. right after OBS starts streaming) for the stream going live,
+            // possibly on a different broadcast ("Stream now" vs scheduled).
+            if (!b.live && util::nowMs() - lastDetectMs > (inBurst() ? kBurstRecheckMs : kUpcomingRecheckMs)) {
                 lastDetectMs = util::nowMs();
-                Detection again = detect(token->accessToken, channel);
+                Detection again = detect(token->accessToken, channel, false);
                 if (again.broadcast && again.broadcast->chatId != b.chatId && again.broadcast->live) {
                     LOG_INFO("youtube", "switching to the broadcast that went live");
                     break; // outer loop picks it up immediately
@@ -280,7 +311,7 @@ void YouTubeClient::run() {
                     break; // re-detect right away
                 }
                 onStatus_("error", explainApiError(err, channel));
-                int pause = err == "quotaExceeded" || err == "dailyLimitExceeded" ? 300000 : 10000;
+                int pause = err == "quotaExceeded" || err == "dailyLimitExceeded" ? 1800000 : 15000;
                 if (!sleepFor(pause)) return;
                 continue;
             }
@@ -290,6 +321,8 @@ void YouTubeClient::run() {
             if (j.is_object()) {
                 pageToken = j.value("nextPageToken", pageToken);
                 waitMs = std::max(cfg_.minPollMs, j.value("pollingIntervalMillis", 0));
+                // Before the stream starts the chat is quiet: read it slowly.
+                if (!b.live) waitMs = std::max(waitMs, inBurst() ? kBurstRecheckMs : kUpcomingChatPollMs);
                 for (const auto& item : j.value("items", json::array())) {
                     const json sn = item.value("snippet", json::object());
                     const json au = item.value("authorDetails", json::object());

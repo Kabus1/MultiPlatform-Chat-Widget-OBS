@@ -30,12 +30,12 @@ const char* envAny(std::initializer_list<const char*> names) {
     return nullptr;
 }
 
-std::unique_ptr<httplib::Client> makeClient(const std::string& origin, int timeoutSec) {
+std::unique_ptr<httplib::Client> makeClient(const std::string& origin, int timeoutSec, bool followRedirects = true) {
     auto cli = std::make_unique<httplib::Client>(origin);
     cli->set_connection_timeout(timeoutSec, 0);
     cli->set_read_timeout(timeoutSec, 0);
     cli->set_write_timeout(timeoutSec, 0);
-    cli->set_follow_location(true);
+    cli->set_follow_location(followRedirects);
     cli->enable_server_certificate_verification(true);
     if (const char* ca = envAny({"SSL_CERT_FILE"})) cli->set_ca_cert_path(ca);
 
@@ -101,9 +101,9 @@ std::string buildQuery(const Params& params) {
     return q;
 }
 
-Response get(const std::string& url, const Headers& headers, int timeoutSec) {
+Response get(const std::string& url, const Headers& headers, int timeoutSec, bool followRedirects) {
     auto parts = splitUrl(url);
-    auto cli = makeClient(parts.origin, timeoutSec);
+    auto cli = makeClient(parts.origin, timeoutSec, followRedirects);
     return convert(cli->Get(parts.path, toHeaders(headers)));
 }
 

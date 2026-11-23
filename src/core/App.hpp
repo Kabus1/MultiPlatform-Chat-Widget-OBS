@@ -5,6 +5,7 @@
 #include "core/MessagePipeline.hpp"
 #include "core/Settings.hpp"
 #include "core/TokenStore.hpp"
+#include "integrations/ObsWatcher.hpp"
 #include "net/OAuth.hpp"
 #include "platforms/PlatformClient.hpp"
 #include "services/AudioPlayer.hpp"
@@ -95,6 +96,13 @@ private:
     std::map<std::string, PendingLogin> pendingStates_; // OAuth state -> attempt
     std::map<std::string, std::string> authError_;      // platform -> last auth problem
     std::map<std::string, int64_t> refreshRetryAtMs_;   // back-off after a failed refresh
+    std::map<std::string, int> refreshFailures_;        // consecutive failed refreshes
+
+    void restartObs();
+    void onObsStreamState(bool streaming);
+    std::mutex obsMutex_;
+    std::unique_ptr<ObsWatcher> obs_;
+    nlohmann::json obsConfig_;
 };
 
 } // namespace usc

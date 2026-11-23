@@ -72,6 +72,11 @@ HINTERNET WebSocketClient::Impl::connect(std::string& error) {
                         WINHTTP_HEADER_NAME_BY_INDEX, &status, &size, WINHTTP_NO_HEADER_INDEX);
     if (status != 101) {
         error = "handshake rejected (HTTP " + std::to_string(status) + ")";
+        // Some servers (TikTok) explain the refusal, e.g. "Handshake-Msg: DEVICE_BLOCKED".
+        wchar_t msg[256];
+        DWORD msgSize = sizeof(msg);
+        if (WinHttpQueryHeaders(req.get(), WINHTTP_QUERY_CUSTOM, L"Handshake-Msg", msg, &msgSize, WINHTTP_NO_HEADER_INDEX))
+            error += " " + winhttp::narrow(std::wstring(msg, msgSize / sizeof(wchar_t)));
         return nullptr;
     }
     HINTERNET ws = WinHttpWebSocketCompleteUpgrade(req.get(), 0);

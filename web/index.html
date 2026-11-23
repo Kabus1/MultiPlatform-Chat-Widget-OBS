@@ -74,7 +74,8 @@
         <details>
           <summary>Stream</summary>
           <label>Video ID / URL <small>(empty = your live or upcoming stream, found automatically)</small><input type="text" data-key="youtube.videoId" placeholder="https://youtube.com/live/..."></label>
-          <label>Minimum poll interval (ms)<input type="number" min="2000" step="500" data-key="youtube.minPollMs"></label>
+          <label>Minimum poll interval while live (ms)<input type="number" min="2000" step="500" data-key="youtube.minPollMs"></label>
+          <label>When not live, check at most every (minutes)<input type="number" min="1" max="60" data-key="youtube.idleCheckMaxMinutes"></label>
           <label class="check"><input type="checkbox" data-key="youtube.showBacklog"> Show recent messages on connect</label>
         </details>
         <details>
@@ -122,11 +123,26 @@
         <p class="account" data-account="tiktok"></p>
         <label>TikTok username<input type="text" data-key="tiktok.username" placeholder="@yourname" spellcheck="false"></label>
         <div class="btn-row"><button data-reconnect="tiktok">Reconnect</button></div>
+        <p class="hint">No keys or TikTok developer account: the app joins your LIVE like a viewer. "connected" appears only once TikTok has actually let it into the room.</p>
         <details>
-          <summary>Signing server</summary>
-          <p class="hint">TikTok has no public LIVE-chat API. Reading chat needs signed requests, done by a signing server. Euler Stream offers a free API key at eulerstream.com.</p>
+          <summary>Advanced: signing server (optional, not needed)</summary>
+          <p class="hint">Only used if you enter an API key: a fallback if TikTok ever blocks the direct viewer connection.</p>
           <label>API key<input type="password" data-key="tiktok.apiKey" autocomplete="off"></label>
           <label>Signing server URL<input type="text" data-key="tiktok.signServer" spellcheck="false"></label>
+        </details>
+      </div>
+
+      <div class="card platform-card" data-platform="obs">
+        <div class="card-head"><h3>OBS link</h3>
+          <span class="pill" data-status="obs">disabled</span>
+          <label class="switch"><input type="checkbox" data-key="obs.enabled"><span></span></label></div>
+        <p class="account" data-account="obs"></p>
+        <p class="hint">When you start streaming in OBS, YouTube and TikTok are checked at once, so nothing has to poll while you are offline. Needs OBS 28+ with Tools &gt; WebSocket Server Settings enabled.</p>
+        <details>
+          <summary>OBS WebSocket</summary>
+          <label>Host<input type="text" data-key="obs.host" spellcheck="false"></label>
+          <label>Port<input type="number" min="1" max="65535" data-key="obs.port"></label>
+          <label>Password <small>(from OBS: Show Connect Info)</small><input type="password" data-key="obs.password" autocomplete="off"></label>
         </details>
       </div>
       <p class="status-line" data-detail></p>

@@ -31,6 +31,7 @@ json Settings::defaults() {
             {"clientSecret", ""},
             {"videoId", ""},   // empty = the logged-in account's live / upcoming broadcast
             {"minPollMs", 6000}, // protects the 10k/day API quota
+            {"idleCheckMaxMinutes", 10}, // not live: checks back off up to this (OBS start = instant check)
             {"showBacklog", true},
         }},
         {"kick", {
@@ -45,6 +46,14 @@ json Settings::defaults() {
             {"resolvedSlug", ""},
             {"resolvedChatroomId", ""},
             {"resolvedUserId", ""},
+        }},
+        {"obs", {
+            // OBS's own WebSocket server (Tools > WebSocket Server Settings):
+            // "stream started" makes YouTube/TikTok check at once instead of polling.
+            {"enabled", true},
+            {"host", "127.0.0.1"},
+            {"port", 4455},
+            {"password", ""},
         }},
         {"tiktok", {
             {"enabled", false},

@@ -10,6 +10,7 @@
 #include "net/Protobuf.hpp"
 #include "platforms/KickClient.hpp"
 #include "platforms/TikTokClient.hpp"
+#include "integrations/ObsWatcher.hpp"
 
 #include <miniz.h>
 #include "platforms/TwitchClient.hpp"
@@ -542,6 +543,46 @@ void testYouTubeDetection() {
     CHECK(YouTubeClient::explainApiError("insufficientPermissions", "").find("Login with YouTube") != std::string::npos);
 }
 
+void testViewerConnection() {
+    // Signing-free WebSocket URL: viewer identity, room id, no signature params.
+    std::string url = TikTokClient::buildDirectWsUrl("7300000000000000001", 123.456);
+    CHECK(url.rfind("wss://webcast-ws.tiktok.com/webcast/im/ws_proxy/ws_reuse_supplement/?", 0) == 0);
+    CHECK(url.find("room_id=7300000000000000001") != std::string::npos);
+    CHECK(url.find("identity=audience") != std::string::npos);
+    CHECK(url.find("compress=gzip") != std::string::npos);
+    CHECK(url.find("last_rtt=123.456") != std::string::npos);
+    CHECK(url.find("X-Bogus") == std::string::npos && url.find("msToken") == std::string::npos &&
+          url.find("signature") == std::string::npos);
+
+    CHECK(TikTokClient::extractTtwid({"tt_csrf_token=x; path=/", "ttwid=1%7Cabc%7C123; Path=/; Domain=tiktok.com; HttpOnly"}) ==
+          "1%7Cabc%7C123");
+    CHECK(TikTokClient::extractTtwid({"msToken=1; path=/"}).empty());
+    CHECK(TikTokClient::normalizeUser("https://www.tiktok.com/@IsKorv/live") == "iskorv");
+    CHECK(TikTokClient::normalizeUser(" @iskorv ") == "iskorv");
+
+    // Live check: live when either status is 2; roomId "0" is never live.
+    auto r = TikTokClient::parseRoomInfo(R"({"statusCode":0,"data":{"user":{"roomId":"73","status":2},"liveRoom":{"status":4}}})");
+    CHECK(r.found && r.live);
+    r = TikTokClient::parseRoomInfo(R"({"statusCode":0,"data":{"user":{"roomId":"73","status":4},"liveRoom":{"status":2}}})");
+    CHECK(r.found && r.live);
+    r = TikTokClient::parseRoomInfo(R"({"statusCode":0,"data":{"user":{"roomId":"0","status":2}}})");
+    CHECK(r.found && !r.live);
+    r = TikTokClient::parseRoomInfo(R"({"statusCode":19881007,"data":{}})");
+    CHECK(r.notFound && !r.found);
+    r = TikTokClient::parseRoomInfo(R"({"statusCode":10101,"message":"busy"})");
+    CHECK(!r.found && !r.notFound && r.error.find("10101") != std::string::npos);
+
+    // STREAM_ENDED (3) and STREAM_ENDED_BAN (4) both end the session; pause (1) does not.
+    CHECK(TikTokClient::isStreamEnd(pb::Writer().varint(2, 4).str()));
+    CHECK(!TikTokClient::isStreamEnd(pb::Writer().varint(2, 1).str()));
+
+    // obs-websocket v5 authentication (value computed independently in Python).
+    CHECK(ObsWatcher::authResponse("supersecretpassword", "lM1GncleQOaCu9lT1yeUZhFYnqhsLLP1G5lAGo3ixaI=",
+                                   "+IxH4CnCiqpX1rM9scsNynZzbOe4KhDeYcTNS3PDaeY=") ==
+          "1Ct943GAT+6YQUUX47Ia/ncufilbe6+oD6lY+5kaCu4=");
+    CHECK(util::base64Encode("ab") == "YWI=" && util::base64Encode("abc") == "YWJj");
+}
+
 int main() {
     testTwitchParse();
     testKickParse();
@@ -559,6 +600,7 @@ int main() {
     testTikTokProtocol();
     testOAuthHelpers();
     testYouTubeDetection();
+    testViewerConnection();
     testSettingsSanitize();
     if (failures) {
         std::cerr << failures << " check(s) failed\n";

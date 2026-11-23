@@ -32,6 +32,7 @@
   const chatEl = $('#chat');
 
   let settings = null;
+  const loginPending = {}; // platform -> login URL while a browser login is in progress
   let status = { platforms: {} };
 
   // ------------------------------------------------------------------ api
@@ -299,7 +300,7 @@
       }
       const acc = $(`[data-account="${p}"]`);
       if (acc) {
-        if (p === 'kick' || p === 'tiktok') {
+        if (p === 'kick' || p === 'tiktok' || p === 'obs') {
           // No login on these platforms: show what is happening, and why if it fails.
           let text = st.state === 'disabled' ? '' : (st.detail || st.state);
           if (p === 'kick' && st.chatroomId && st.state !== 'connected')
@@ -314,6 +315,19 @@
           if (why) acc.textContent += ` — ${why}`;
           acc.classList.toggle('warn-text', st.state === 'error' || !!st.authError);
         }
+        // Logged in: no big "Login" button, just a quiet "Switch account".
+        const loginBtn = $(`[data-login="${p}"]`);
+        if (loginBtn) {
+          const base = p === 'youtube' ? 'YouTube' : 'Twitch';
+          loginBtn.textContent = st.loggedIn ? 'Switch account' : `Login with ${base}`;
+          loginBtn.classList.toggle('primary', !st.loggedIn);
+          const logoutBtn = $(`[data-logout="${p}"]`);
+          if (logoutBtn) logoutBtn.hidden = !st.loggedIn;
+        }
+        if (st.loggedIn && loginPending[p]) {
+          delete loginPending[p];
+          $('[data-detail]').textContent = '';
+        }
         if (p === 'youtube') {
           const cred = $('[data-yt-cred]');
           if (cred) cred.textContent = st.credentials ? `(${st.credentials})` : '';
@@ -323,6 +337,17 @@
       }
       const redirect = $(`[data-redirect="${p}"]`);
       if (redirect && st.redirectUri) redirect.textContent = st.redirectUri;
+    }
+    const obs = status.platforms.obs || { state: 'disabled' };
+    const obsPill = $('[data-status="obs"]');
+    if (obsPill) {
+      obsPill.textContent = obs.state;
+      obsPill.dataset.state = obs.state;
+    }
+    const obsAcc = $('[data-account="obs"]');
+    if (obsAcc) {
+      obsAcc.textContent = obs.state === 'disabled' ? '' : obs.detail || obs.state;
+      obsAcc.classList.toggle('warn-text', obs.state === 'error');
     }
     $('#config-path').textContent = status.configPath || '';
     const links = status.links || {};
@@ -427,7 +452,15 @@
     await flushSave();
     try {
       const { url } = await api(`/api/auth/${p}/login`, { method: 'POST' });
-      $('[data-detail]').textContent = 'A browser window was opened to log in. If nothing opened, visit: ' + url;
+      // Short note + a link to reopen; the long URL is never printed. Cleared
+      // automatically once the login succeeds (see renderStatus).
+      loginPending[p] = url;
+      const d = $('[data-detail]');
+      d.textContent = 'Finish logging in in the browser window that opened. ';
+      const again = el('a', null, 'Open it again');
+      again.href = '#';
+      again.onclick = (ev) => { ev.preventDefault(); window.open(url, '_blank'); };
+      d.append(again);
     } catch (e) {
       $('[data-detail]').textContent = e.message;
       alert(e.message);

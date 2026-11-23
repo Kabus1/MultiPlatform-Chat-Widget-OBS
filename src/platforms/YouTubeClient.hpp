@@ -20,7 +20,12 @@ namespace usc {
 //   2. liveBroadcasts?broadcastStatus=active      (live now)
 //   3. liveBroadcasts?broadcastStatus=upcoming    (preview / starting /
 //      "Stream now" persistent broadcast): its chat is already open
-//   4. nothing: "waiting", re-checked every 15s or immediately on Reconnect
+//   4. nothing: "waiting"
+//
+// API quota: every check costs YouTube Data API quota, so idle checks back
+// off (1 min doubling up to idleMaxMs, active broadcasts only; upcoming every
+// 3rd check). checkNow() - called by Reconnect and when OBS starts streaming -
+// starts a short burst (every 15s for 3 min) and then backs off again.
 class YouTubeClient : public PlatformClient {
 public:
     struct Config {
@@ -30,6 +35,7 @@ public:
         TokenProvider tokens;
         // Why no token is available (not logged in, login expired, ...).
         std::function<std::string()> authProblem;
+        int idleMaxMs = 600000;  // longest wait between checks while not live
     };
 
     struct Broadcast {
@@ -64,7 +70,10 @@ private:
 
     void run();
     bool sleepFor(int ms); // false when stopping; returns early on checkNow()
-    Detection detect(const std::string& accessToken, const std::string& channel);
+    Detection detect(const std::string& accessToken, const std::string& channel, bool includeUpcoming);
+    bool inBurst() const;
+    // Next idle wait: 15s in a burst, else 60s doubling up to idleMaxMs.
+    int nextIdleDelay();
     std::string authMessage();
 
     Config cfg_;
@@ -73,6 +82,9 @@ private:
     std::thread thread_;
     std::atomic<bool> running_{false};
     std::atomic<bool> wake_{false};
+    std::atomic<int64_t> burstUntilMs_{0};
+    int idleDelayMs_ = 60000;
+    int idleChecks_ = 0;
     std::mutex mutex_;
     std::condition_variable cv_;
 };

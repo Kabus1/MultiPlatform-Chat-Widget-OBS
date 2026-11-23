@@ -19,25 +19,29 @@
 
 namespace usc {
 
-// TikTok LIVE chat (read-only), via TikTok's internal "webcast" protocol -
-// the same one TikTok-Live-Connector / TikTokLive use. TikTok offers no
-// public LIVE-chat API.
+// TikTok LIVE chat (read-only), connected like a viewer's browser - no
+// TikTok developer account, no API key, no signing server:
 //
-//   1. resolveRoom():   @username -> room id + live status (tiktok.com)
-//   2. fetchConnect():  room id -> WebSocket URL, cursor and cookies. This
-//                       needs TikTok's anti-bot signatures, so it goes through
-//                       a signing server (default Euler Stream, API key).
-//   3. WebSocket:       binary WebcastPushFrame protobufs, gzip payloads;
-//                       we reply with ack frames and send a heartbeat every 10s.
+//   1. live check:  GET tiktok.com/api-live/user/room?uniqueId=<user>
+//                   -> room id; live when liveRoom.status or user.status == 2
+//   2. ttwid:       anonymous cookie from GET https://www.tiktok.com/
+//                   (redirects not followed; TikTok sets it intermittently)
+//   3. WebSocket:   wss://webcast-ws.tiktok.com/webcast/im/ws_proxy/
+//                   ws_reuse_supplement/?room_id=..&identity=audience&...
+//                   (no X-Bogus / msToken / signature), Cookie: ttwid
+//   4. frames:      heartbeat + im_enter_room, then WebcastPushFrame
+//                   protobufs with gzip payloads; ack when asked.
 //
-// Steps 1 and 2 are the parts TikTok changes most often; they are isolated
-// here so they can be fixed without touching the rest of the app.
+// "connected" means TikTok accepted us into the room (first frame after
+// entering), not just that a socket opened. A signing server (e.g. Euler
+// Stream) is only used as an optional fallback when an API key is set.
 class TikTokClient : public PlatformClient {
 public:
     struct Config {
         std::string username;   // @handle
-        std::string signServer; // e.g. https://tiktok.eulerstream.com
-        std::string apiKey;     // signing server key
+        std::string signServer; // optional fallback, e.g. https://tiktok.eulerstream.com
+        std::string apiKey;     // optional: only used with signServer
+        int idleMaxMs = 300000; // not live: checks back off up to this
     };
 
     // --- protocol (static so it can be unit-tested) ------------------------
@@ -61,7 +65,10 @@ public:
     struct RoomInfo {
         std::string roomId;
         bool live = false;
-        bool found = false;
+        bool found = false;     // the account exists
+        bool notFound = false;  // TikTok says the user does not exist
+        bool blocked = false;   // HTTP 403/429: rate-limited / blocked
+        std::string error;
     };
 
     static std::optional<PushFrame> parsePushFrame(std::string_view data);
@@ -74,6 +81,11 @@ public:
     static RoomInfo parseRoomInfo(const std::string& body);
     static bool gunzip(std::string_view in, std::string& out);
     static std::string heartbeatFrame(const std::string& roomId);
+    // Signing-free WebSocket URL (viewer connection).
+    static std::string buildDirectWsUrl(const std::string& roomId, double lastRtt);
+    // "ttwid=...; Path=/..." Set-Cookie lines -> ttwid value ("" if absent).
+    static std::string extractTtwid(const std::vector<std::string>& setCookies);
+    static std::string normalizeUser(const std::string& input);
     static std::string enterRoomFrame(const std::string& roomId);
 
     TikTokClient(Config cfg, MessageSink onMessage, StatusSink onStatus);
@@ -81,6 +93,7 @@ public:
 
     void start() override;
     void stop() override;
+    bool checkNow() override;
 
 private:
     struct ConnectInfo {
@@ -89,23 +102,34 @@ private:
     };
 
     void run();
-    RoomInfo resolveRoom(std::string& error);
-    std::optional<ConnectInfo> fetchConnect(const std::string& roomId, std::string& error);
+    RoomInfo resolveRoom();
+    std::string fetchTtwid(std::string& error);
+    std::optional<ConnectInfo> fetchConnect(const std::string& roomId, std::string& error); // signing server
     void onFrame(const std::string& data);
-    bool sleepFor(int ms);
+    bool sleepFor(int ms); // returns early on checkNow()
+    bool inBurst() const;
+    int nextIdleDelay();
 
     Config cfg_;
+    std::string user_;
     MessageSink onMessage_;
     StatusSink onStatus_;
     std::thread worker_;
     std::atomic<bool> running_{false};
+    std::atomic<bool> wake_{false};
     std::mutex mutex_;
     std::condition_variable cv_;
     std::unique_ptr<WebSocketClient> ws_;
     std::string roomId_;
-    std::string cookies_; // from tiktok.com + the signing server
+    std::string cookies_;                // signing-server mode
+    std::string ttwid_;                  // direct mode
+    std::atomic<bool> needFreshTtwid_{false};
     std::atomic<bool> streamEnded_{false};
+    std::atomic<bool> joined_{false};    // TikTok answered after im_enter_room
     std::atomic<int64_t> lastFrameMs_{0};
+    std::atomic<uint64_t> chatCount_{0};
+    std::atomic<int64_t> burstUntilMs_{0};
+    int idleDelayMs_ = 60000;
 };
 
 } // namespace usc

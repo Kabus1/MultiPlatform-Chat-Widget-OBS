@@ -26,6 +26,8 @@ std::string replaceAll(std::string s, std::string_view from, std::string_view to
 
 std::string randomToken(size_t bytes = 16);
 std::string base64Decode(std::string_view in);
+// Standard padded base64 (RFC 4648 section 4).
+std::string base64Encode(std::string_view bytes);
 // Unpadded base64url (RFC 4648 section 5), as used by OAuth PKCE.
 std::string base64UrlEncode(std::string_view bytes);
 // SHA-256 digest (32 raw bytes). Self-contained: no OpenSSL / BCrypt needed.

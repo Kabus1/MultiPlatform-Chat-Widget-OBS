@@ -178,6 +178,16 @@ std::string base64Decode(std::string_view in) {
     return out;
 }
 
+std::string base64Encode(std::string_view bytes) {
+    std::string out = base64UrlEncode(bytes);
+    for (char& c : out) {
+        if (c == '-') c = '+';
+        else if (c == '_') c = '/';
+    }
+    while (out.size() % 4) out.push_back('=');
+    return out;
+}
+
 std::string base64UrlEncode(std::string_view bytes) {
     static const char* chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     std::string out;

@@ -35,7 +35,7 @@ using Params = std::vector<std::pair<std::string, std::string>>;
 
 // Blocking HTTPS helpers built on cpp-httplib. They honour HTTPS_PROXY and
 // SSL_CERT_FILE from the environment so the app works behind corporate proxies.
-Response get(const std::string& url, const Headers& headers = {}, int timeoutSec = 10);
+Response get(const std::string& url, const Headers& headers = {}, int timeoutSec = 10, bool followRedirects = true);
 Response postForm(const std::string& url, const Params& form, const Headers& headers = {}, int timeoutSec = 10);
 Response postJson(const std::string& url, const std::string& json, const Headers& headers = {}, int timeoutSec = 10);
 
