@@ -31,6 +31,12 @@ endif()
 # ---------------------------------------------------------------------------
 include(FetchContent)
 set(FETCHCONTENT_QUIET ON)
+# Header-only / hand-built dependencies are fetched with SOURCE_SUBDIR set to
+# a folder that has no CMakeLists.txt: FetchContent_MakeAvailable() then only
+# downloads them and never runs their own CMake scripts (some declare
+# cmake_minimum_required < 3.5, which CMake 4 rejects). This replaces the
+# deprecated single-argument FetchContent_Populate() (policy CMP0169).
+set(USC_NO_CMAKE SOURCE_SUBDIR usc-download-only)
 find_package(Threads REQUIRED)
 
 # nlohmann/json (header only)
@@ -47,11 +53,9 @@ endif()
 FetchContent_Declare(httplib
   GIT_REPOSITORY https://github.com/yhirose/cpp-httplib.git
   GIT_TAG v0.18.3
-  GIT_SHALLOW ON)
-FetchContent_GetProperties(httplib)
-if(NOT httplib_POPULATED)
-  FetchContent_Populate(httplib) # header only: no add_subdirectory
-endif()
+  GIT_SHALLOW ON
+  ${USC_NO_CMAKE})
+FetchContent_MakeAvailable(httplib) # header only
 
 if(NOT WIN32)
   find_package(OpenSSL 3.0 REQUIRED)
@@ -66,6 +70,7 @@ if(NOT WIN32)
       GIT_TAG v11.4.5
       GIT_SHALLOW ON)
     FetchContent_MakeAvailable(ixwebsocket)
+    target_compile_options(ixwebsocket PRIVATE -w) # third-party: keep our build log clean
     if(NOT TARGET ixwebsocket::ixwebsocket)
       add_library(ixwebsocket::ixwebsocket ALIAS ixwebsocket)
     endif()
@@ -76,23 +81,32 @@ endif()
 FetchContent_Declare(miniaudio
   GIT_REPOSITORY https://github.com/mackron/miniaudio.git
   GIT_TAG 0.11.25
-  GIT_SHALLOW ON)
-FetchContent_GetProperties(miniaudio)
-if(NOT miniaudio_POPULATED)
-  FetchContent_Populate(miniaudio) # header only: no add_subdirectory
-endif()
+  GIT_SHALLOW ON
+  ${USC_NO_CMAKE})
+FetchContent_MakeAvailable(miniaudio) # header only
 
 # miniz: gzip/deflate for TikTok's compressed WebSocket payloads (works on
-# Windows without zlib).
-set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-set(BUILD_FUZZERS OFF CACHE BOOL "" FORCE)
-set(BUILD_TESTS OFF CACHE BOOL "" FORCE)
-set(INSTALL_PROJECT OFF CACHE BOOL "" FORCE)
+# Windows without zlib). Its own CMakeLists.txt needs CMake < 4, so the four
+# sources are built here as a plain static library instead.
 FetchContent_Declare(miniz
   GIT_REPOSITORY https://github.com/richgel999/miniz.git
   GIT_TAG 3.0.2
-  GIT_SHALLOW ON)
+  GIT_SHALLOW ON
+  ${USC_NO_CMAKE})
 FetchContent_MakeAvailable(miniz)
+enable_language(C)
+file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/miniz-include/miniz_export.h
+  "#pragma once\n#define MINIZ_EXPORT\n") # static library: no dllexport
+add_library(miniz STATIC
+  ${miniz_SOURCE_DIR}/miniz.c
+  ${miniz_SOURCE_DIR}/miniz_tdef.c
+  ${miniz_SOURCE_DIR}/miniz_tinfl.c
+  ${miniz_SOURCE_DIR}/miniz_zip.c)
+target_include_directories(miniz SYSTEM PUBLIC ${miniz_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR}/miniz-include)
+set_target_properties(miniz PROPERTIES C_STANDARD 99 POSITION_INDEPENDENT_CODE ON)
+if(MSVC)
+  target_compile_definitions(miniz PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
 
 # --- Native desktop window (webview: WebView2 / WKWebView / WebKitGTK) ------
 # Windows and macOS always get the window. Linux gets it when WebKitGTK
@@ -118,11 +132,9 @@ if(USC_DESKTOP_WINDOW)
     FetchContent_Declare(mswebview2
       URL https://api.nuget.org/v3-flatcontainer/microsoft.web.webview2/${USC_WEBVIEW2_VERSION}/microsoft.web.webview2.${USC_WEBVIEW2_VERSION}.nupkg
       DOWNLOAD_NAME webview2.zip
-      DOWNLOAD_EXTRACT_TIMESTAMP ON)
-    FetchContent_GetProperties(mswebview2)
-    if(NOT mswebview2_POPULATED)
-      FetchContent_Populate(mswebview2)
-    endif()
+      DOWNLOAD_EXTRACT_TIMESTAMP ON
+      ${USC_NO_CMAKE})
+    FetchContent_MakeAvailable(mswebview2) # headers only
     set(MSWebView2_ROOT ${mswebview2_SOURCE_DIR} CACHE PATH "" FORCE)
     set(WEBVIEW_MSWEBVIEW2_VERSION ${USC_WEBVIEW2_VERSION} CACHE STRING "" FORCE)
     if(MINGW)
