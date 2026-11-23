@@ -84,8 +84,8 @@ public:
             error = "No Direct3D 11 GPU with video processing available (" + hex(hr) + ")";
             return false;
         }
-        if (FAILED(device_->QueryInterface(IID_ID3D11VideoDevice, videoDevice_.putVoid())) ||
-            FAILED(context_->QueryInterface(IID_ID3D11VideoContext, videoContext_.putVoid()))) {
+        if (FAILED(device_->QueryInterface(__uuidof(ID3D11VideoDevice), videoDevice_.putVoid())) ||
+            FAILED(context_->QueryInterface(__uuidof(ID3D11VideoContext), videoContext_.putVoid()))) {
             error = "The GPU driver has no Direct3D 11 video processor";
             releaseDevice();
             return false;
@@ -110,9 +110,9 @@ public:
         ComRef<IDXGIDevice> dxgiDevice;
         ComRef<IDXGIAdapter> adapter;
         ComRef<IDXGIFactory2> factory;
-        hr = device_->QueryInterface(IID_IDXGIDevice, dxgiDevice.putVoid());
+        hr = device_->QueryInterface(__uuidof(IDXGIDevice), dxgiDevice.putVoid());
         if (SUCCEEDED(hr)) hr = dxgiDevice->GetAdapter(adapter.put());
-        if (SUCCEEDED(hr)) hr = adapter->GetParent(IID_IDXGIFactory2, factory.putVoid());
+        if (SUCCEEDED(hr)) hr = adapter->GetParent(__uuidof(IDXGIFactory2), factory.putVoid());
         DXGI_SWAP_CHAIN_DESC1 sd{};
         sd.Width = UINT(outW);
         sd.Height = UINT(outH);
@@ -131,7 +131,7 @@ public:
             }
         }
         if (SUCCEEDED(hr)) factory->MakeWindowAssociation(hwnd_, DXGI_MWA_NO_ALT_ENTER);
-        if (SUCCEEDED(hr)) hr = swapChain_->GetBuffer(0, IID_ID3D11Texture2D, backBuffer_.putVoid());
+        if (SUCCEEDED(hr)) hr = swapChain_->GetBuffer(0, __uuidof(ID3D11Texture2D), backBuffer_.putVoid());
         if (FAILED(hr)) {
             error = "Could not create the output swap chain (" + hex(hr) + ")";
             close();
@@ -533,7 +533,7 @@ private:
             ComRef<IWICBitmapEncoder> encoder;
             ComRef<IWICBitmapFrameEncode> frame;
             ComRef<IPropertyBag2> props;
-            HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_IWICImagingFactory,
+            HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, __uuidof(IWICImagingFactory),
                                           factory.putVoid());
             if (SUCCEEDED(hr)) hr = CreateStreamOnHGlobal(nullptr, TRUE, stream.put());
             if (SUCCEEDED(hr)) hr = factory->CreateEncoder(GUID_ContainerFormatJpeg, nullptr, encoder.put());

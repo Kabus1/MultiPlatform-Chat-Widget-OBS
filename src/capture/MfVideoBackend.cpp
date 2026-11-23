@@ -170,7 +170,7 @@ struct Session {
         f.subtype = subtype;
         f.timestampUs = ts100ns / 10;
         ComRef<IMF2DBuffer> b2;
-        if (SUCCEEDED(buf->QueryInterface(IID_IMF2DBuffer, b2.putVoid()))) {
+        if (SUCCEEDED(buf->QueryInterface(__uuidof(IMF2DBuffer), b2.putVoid()))) {
             BYTE* scan0 = nullptr;
             LONG pitch = 0;
             if (FAILED(b2->Lock2D(&scan0, &pitch))) return;
@@ -206,7 +206,7 @@ public:
     explicit ReaderCallback(std::shared_ptr<Session> s) : session_(std::move(s)) {}
 
     STDMETHODIMP QueryInterface(REFIID iid, void** ppv) override {
-        if (IsEqualIID(iid, IID_IUnknown) || IsEqualIID(iid, IID_IMFSourceReaderCallback)) {
+        if (IsEqualIID(iid, __uuidof(IUnknown)) || IsEqualIID(iid, __uuidof(IMFSourceReaderCallback))) {
             *ppv = static_cast<IMFSourceReaderCallback*>(this);
             AddRef();
             return S_OK;

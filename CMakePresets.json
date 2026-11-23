@@ -35,7 +35,8 @@
       "displayName": "Windows x64 Release (vcpkg manifest)",
       "description": "Optional: takes nlohmann-json from vcpkg.json. Needs VCPKG_ROOT (set automatically in the VS 2022 Developer environment).",
       "inherits": "x64-release",
-      "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
+      "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+      "cacheVariables": { "VCPKG_TARGET_TRIPLET": "x64-windows-static" }
     },
     {
       "name": "linux-release",

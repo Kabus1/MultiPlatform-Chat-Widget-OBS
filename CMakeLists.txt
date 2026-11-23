@@ -1,4 +1,13 @@
 cmake_minimum_required(VERSION 3.21)
+
+# MSVC: one self-contained .exe with the C/C++ runtime linked statically
+# (/MT, /MTd in Debug). Set globally *before* any dependency is configured so
+# FetchContent subprojects (miniz, ...) use the same runtime - a mix of /MT
+# and /MD causes LNK4098 / LNK4217 and runtime-heap mismatches. The policy
+# default makes subprojects with an older cmake_minimum_required honour it.
+set(CMAKE_POLICY_DEFAULT_CMP0091 NEW)
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>" CACHE STRING "MSVC runtime library")
+
 project(UnifiedStreamChat VERSION 0.3.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -219,7 +228,8 @@ if(WIN32)
     NOMINMAX WIN32_LEAN_AND_MEAN= _WIN32_WINNT=0x0A00 UNICODE _UNICODE) # empty value matches webview.h
   target_link_libraries(usc_core PUBLIC winhttp ws2_32 shell32 ole32 user32
     # video capture relay: Media Foundation + Direct3D 11 + WIC (all in-box)
-    mfplat mf mfreadwrite mfuuid d3d11 dxgi windowscodecs uuid)
+    # (dxguid: IID_* for D3D11/DXGI; the code uses __uuidof, this is a backstop)
+    mfplat mf mfreadwrite mfuuid d3d11 dxgi dxguid windowscodecs uuid)
 else()
   target_sources(usc_core PRIVATE
     src/net/Http_httplib.cpp
@@ -235,8 +245,6 @@ endif()
 
 if(MSVC)
   target_compile_options(usc_core PUBLIC /W4 /utf-8 /bigobj /permissive-)
-  # One self-contained .exe: link the C++ runtime statically.
-  set_property(TARGET usc_core PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 elseif(MINGW)
   target_compile_options(usc_core PUBLIC -Wall -Wextra -Wa,-mbig-obj)
   target_link_options(usc_core PUBLIC -static)
@@ -257,7 +265,6 @@ if(WIN32)
     endif()
   endif()
   if(MSVC)
-    set_property(TARGET unified_stream_chat PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
     set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT unified_stream_chat)
   endif()
 endif()
@@ -267,9 +274,6 @@ if(USC_BUILD_TESTS)
   enable_testing()
   add_executable(unit_tests tests/unit_tests.cpp)
   target_link_libraries(unit_tests PRIVATE usc_core)
-  if(MSVC)
-    set_property(TARGET unit_tests PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
-  endif()
   add_test(NAME unit_tests COMMAND unit_tests)
 endif()
 
