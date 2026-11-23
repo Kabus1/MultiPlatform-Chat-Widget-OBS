@@ -99,8 +99,8 @@ private:
     // frame statistics (guarded by statsMutex_; touched on the capture thread)
     mutable std::mutex statsMutex_;
     FramePacer pacer_;
-    RateMeter captureRate_, outputRate_;
-    uint64_t frames_ = 0, presented_ = 0, dropped_ = 0, paced_ = 0;
+    RateMeter captureRate_;
+    uint64_t frames_ = 0, rejected_ = 0, paced_ = 0;
     int64_t lastFrameMs_ = 0;
     int64_t sessionStartMs_ = 0;
 };

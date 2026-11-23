@@ -248,14 +248,15 @@ capture.html ──HTTP/SSE──> WebServer ──> CaptureRelay (worker thread
                                            ├─ MfVideoBackend  Media Foundation source reader (async)
                                            │     device mode exactly as reported; NV12/YUY2 pass through
                                            └─ D3DOutputWindow  top-level window + D3D11 flip swap chain
-                                                 GPU video processor: YUV→RGB, scaling, letterbox
-                                                 Present(DO_NOT_WAIT); preview JPEG only on request
+                                                 capture thread → latest-frame mailbox → render thread
+                                                 pixel shader: YUV→RGB, scaling, letterbox → Present
+                                                 preview JPEG only on request
 ```
 
 **Pitfalls it avoids:**
 - **Device contention.** The device is opened once. Listing devices never opens them. Probing opens a device briefly and is never done on the device that is streaming. Errors name the cause: "in use by another app", "blocked by camera privacy", "disconnected".
 - **Unsupported modes.** Only modes the device reports are offered. *Auto* picks one that fits the output, in this order: fits the resolution, reaches the FPS, most detail, least wasted FPS, cheapest format. A saved mode the device no longer offers falls back to auto, with a note.
-- **Colour and CPU cost.** NV12 and YUY2 go straight to the GPU, where the video processor does BT.709/601 limited→full range conversion and scaling. Only MJPG/RGB modes use Windows' decoder, and the UI marks them "CPU decode".
+- **Colour and CPU cost.** NV12 and YUY2 are uploaded to the GPU as plain textures (one copy per plane), where a small pixel shader does BT.709/601 limited→full range conversion and scaling. This works the same on every Direct3D 10/11 GPU; it does not depend on driver video-processor support. Only MJPG/RGB modes use Windows' decoder, and the UI marks them "CPU decode".
 - **FPS.** The cap drops frames with a drift-free pacer (120 → 60 shows every other frame). A cap at or above the source rate does nothing. The page shows the measured capture FPS next to the output FPS.
 - **Black screen in Game Capture.**
   - The window is a plain top-level window (no tool-window or layered style) drawn by a D3D11 flip-model swap chain, the path Game Capture hooks.

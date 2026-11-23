@@ -1,5 +1,16 @@
 // Windows output: a normal top-level window whose content is a D3D11 flip-model
 // swap chain - the path OBS "Game Capture" (capture specific window) hooks.
+//
+// Threads:
+//   capture thread (Media Foundation callback) -> present(): copies the frame
+//       into a latest-frame mailbox and returns at once. Never touches the GPU.
+//   render thread -> uploads the newest frame, converts YUV->RGB with a pixel
+//       shader, draws it (scaled / letterboxed) into the swap chain, Present().
+//   window thread -> message loop of the output window.
+//
+// The colour conversion is a plain pixel shader on ordinary R8 / R8G8 / RGBA
+// textures (no ID3D11VideoProcessor, no NV12/YUY2 GPU surfaces), so it works
+// the same on every Direct3D 10/11 GPU and driver.
 #ifdef _WIN32
 
 #include "capture/ComRef.hpp"
@@ -15,13 +26,14 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <functional>
-#include <optional>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <vector>
 
@@ -32,8 +44,8 @@ namespace {
 const wchar_t* kClassName = L"USCCaptureOutputWindow";
 constexpr UINT WM_APP_CLOSE = WM_APP + 1;
 constexpr int kPreviewW = 640, kPreviewH = 360;
-constexpr int kPreviewIntervalMs = 200;   // 5 fps, only while someone looks at it
-constexpr int kPreviewIdleMs = 3000;      // stop making previews after this
+constexpr int kPreviewIntervalMs = 200; // 5 fps, only while someone looks at it
+constexpr int kPreviewIdleMs = 3000;    // stop making previews after this
 
 std::wstring widen(const std::string& s) {
     int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
@@ -48,15 +60,70 @@ std::string hex(HRESULT hr) {
     return b;
 }
 
-DXGI_FORMAT dxgiFormat(const std::string& subtype) {
-    return subtype == "YUY2" ? DXGI_FORMAT_YUY2 : DXGI_FORMAT_NV12;
+// --------------------------------------------------------------- shaders
+// One full-screen triangle; NV12 = Y (R8) + interleaved UV (R8G8, half size);
+// YUY2 = one RGBA texel per two pixels (Y0 U Y1 V).
+const char kShaderSource[] = R"(
+struct VO { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
+VO vsMain(uint id : SV_VertexID) {
+    VO o;
+    float2 uv = float2((id << 1) & 2, id & 2);
+    o.uv = uv;
+    o.pos = float4(uv * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
+    return o;
+}
+cbuffer Color : register(b0) { float4 rowR; float4 rowG; float4 rowB; };
+SamplerState smp : register(s0);
+Texture2D<float>  texY  : register(t0);
+Texture2D<float2> texUV : register(t1);
+Texture2D<float4> texP  : register(t2);
+float4 toRgb(float y, float u, float v) {
+    float4 yuv = float4(y, u, v, 1.0);
+    return float4(saturate(dot(rowR, yuv)), saturate(dot(rowG, yuv)), saturate(dot(rowB, yuv)), 1.0);
+}
+float4 psNV12(VO i) : SV_Target {
+    float2 c = texUV.Sample(smp, i.uv);
+    return toRgb(texY.Sample(smp, i.uv), c.x, c.y);
+}
+float4 psYUY2(VO i) : SV_Target {
+    uint w, h;
+    texP.GetDimensions(w, h);
+    int px = min(int(i.uv.x * float(w * 2)), int(w * 2 - 1));
+    int py = min(int(i.uv.y * float(h)), int(h - 1));
+    float4 t = texP.Load(int3(px >> 1, py, 0));
+    return toRgb((px & 1) ? t.z : t.x, t.y, t.w);
+}
+)";
+
+typedef HRESULT(WINAPI* D3DCompileFn)(LPCVOID, SIZE_T, LPCSTR, const D3D_SHADER_MACRO*, ID3DInclude*, LPCSTR,
+                                      LPCSTR, UINT, UINT, ID3DBlob**, ID3DBlob**);
+
+// Limited-range YCbCr -> full-range RGB, as rows applied to (Y, Cb, Cr, 1).
+struct ColorRows {
+    float r[4], g[4], b[4];
+};
+ColorRows colorRows(bool bt709) {
+    const float ys = 255.0f / 219.0f, yo = -16.0f / 219.0f; // Y' = ys*Y + yo
+    const float cs = 255.0f / 224.0f;                        // C' = cs*(C - co)
+    const float co = 128.0f / 255.0f;                        // chroma zero point
+    float kr = bt709 ? 0.2126f : 0.299f, kb = bt709 ? 0.0722f : 0.114f, kg = 1.0f - kr - kb;
+    float rv = 2.0f * (1.0f - kr) * cs;           // R = Y' + rv*Cr'
+    float bu = 2.0f * (1.0f - kb) * cs;           // B = Y' + bu*Cb'
+    float gu = -bu * kb / kg, gv = -rv * kr / kg; // G = Y' + gu*Cb' + gv*Cr'
+    ColorRows c{};
+    c.r[0] = ys; c.r[1] = 0;  c.r[2] = rv; c.r[3] = yo - co * rv;
+    c.g[0] = ys; c.g[1] = gu; c.g[2] = gv; c.g[3] = yo - co * (gu + gv);
+    c.b[0] = ys; c.b[1] = bu; c.b[2] = 0;  c.b[3] = yo - co * bu;
+    return c;
 }
 
-// A video processor converting/scaling from one input size to one output size.
-struct Processor {
-    ComRef<ID3D11VideoProcessorEnumerator> enumerator;
-    ComRef<ID3D11VideoProcessor> processor;
-    int inW = 0, inH = 0, outW = 0, outH = 0;
+// A frame copied out of the capture callback (planes packed with their pitch).
+struct CpuFrame {
+    std::vector<uint8_t> plane0; // NV12: Y   YUY2: packed
+    std::vector<uint8_t> plane1; // NV12: UV
+    int pitch = 0;
+    int width = 0, height = 0;
+    std::string subtype;
 };
 
 class D3DOutputWindow : public OutputSink {
@@ -70,28 +137,19 @@ public:
         outW_ = outW;
         outH_ = outH;
         keepAspect_ = keepAspect;
+        setError("");
+        presented_ = skipped_ = failed_ = 0;
         {
-            std::lock_guard<std::mutex> lock(deviceMutex_);
-            lastError_.clear();
+            std::lock_guard<std::mutex> lock(rateMutex_);
+            rate_ = RateMeter{};
         }
 
-        // --- device (video support needed for the GPU color conversion) ---
-        const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1};
-        UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
-        HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags, levels, 3, D3D11_SDK_VERSION,
-                                       device_.put(), nullptr, context_.put());
-        if (FAILED(hr)) {
-            error = "No Direct3D 11 GPU with video processing available (" + hex(hr) + ")";
-            return false;
-        }
-        if (FAILED(device_->QueryInterface(__uuidof(ID3D11VideoDevice), videoDevice_.putVoid())) ||
-            FAILED(context_->QueryInterface(__uuidof(ID3D11VideoContext), videoContext_.putVoid()))) {
-            error = "The GPU driver has no Direct3D 11 video processor";
-            releaseDevice();
+        if (!createDevice(error) || !createPipeline(error)) {
+            releaseAll();
             return false;
         }
 
-        // --- window on its own thread (its message loop must never wait on us) ---
+        // Window on its own thread (its message loop must never wait on us).
         std::wstring wtitle = widen(title);
         {
             std::unique_lock<std::mutex> lock(windowMutex_);
@@ -102,20 +160,202 @@ public:
         if (!hwnd_) {
             error = "Could not create the output window";
             closeWindow();
-            releaseDevice();
+            releaseAll();
             return false;
         }
+        if (!createSwapChain(error)) {
+            closeWindow();
+            releaseAll();
+            return false;
+        }
+        // Valid (black) content right away, so OBS finds a hookable window
+        // even before the first frame arrives.
+        const float black[4] = {0, 0, 0, 1};
+        context_->ClearRenderTargetView(backBufferRtv_.get(), black);
+        swapChain_->Present(0, 0);
 
-        // --- swap chain at the full output resolution ---
+        {
+            std::lock_guard<std::mutex> lock(mailboxMutex_);
+            quit_ = false;
+            hasPending_ = false;
+        }
+        open_ = true;
+        render_ = std::thread([this] { renderThread(); });
+        LOG_INFO("capture", "output window ", outW, "x", outH, " ready");
+        return true;
+    }
+
+    bool present(const FrameView& f) override {
+        if (!open_ || !f.data || f.width <= 0 || f.height <= 0 || f.pitch <= 0) return false;
+        // Copy into the spare buffer without holding the mailbox lock.
+        CpuFrame& dst = spare_;
+        dst.width = f.width;
+        dst.height = f.height;
+        dst.pitch = f.pitch;
+        dst.subtype = f.subtype;
+        if (f.subtype == "NV12") {
+            size_t ySize = size_t(f.pitch) * size_t(f.height);
+            size_t uvSize = size_t(f.pitch) * size_t((f.height + 1) / 2);
+            size_t uvOff = f.uvOffset ? f.uvOffset : ySize;
+            dst.plane0.assign(f.data, f.data + ySize);
+            dst.plane1.assign(f.data + uvOff, f.data + uvOff + uvSize);
+        } else if (f.subtype == "YUY2") {
+            dst.plane0.assign(f.data, f.data + size_t(f.pitch) * size_t(f.height));
+            dst.plane1.clear();
+        } else {
+            ++failed_;
+            setError("Unsupported frame format " + f.subtype + " (expected NV12 or YUY2)");
+            return false;
+        }
+        {
+            std::lock_guard<std::mutex> lock(mailboxMutex_);
+            std::swap(spare_, pending_);
+            if (hasPending_) ++skipped_; // the render thread had not taken the previous one
+            hasPending_ = true;
+        }
+        mailboxCv_.notify_one();
+        return true;
+    }
+
+    void close() override {
+        open_ = false;
+        {
+            std::lock_guard<std::mutex> lock(mailboxMutex_);
+            quit_ = true;
+        }
+        mailboxCv_.notify_all();
+        if (render_.joinable()) render_.join();
+        if (context_) {
+            context_->ClearState();
+            context_->Flush();
+        }
+        backBufferRtv_.reset();
+        swapChain_.reset(); // before the window goes away
+        closeWindow();
+        releaseAll();
+        std::lock_guard<std::mutex> lock(previewMutex_);
+        previewJpeg_.clear();
+    }
+
+    OutputState state() const override {
+        OutputState s;
+        s.open = open_;
+        HWND h = hwnd_;
+        if (h) {
+            s.visible = IsWindowVisible(h) != FALSE;
+            s.minimized = IsIconic(h) != FALSE;
+        }
+        s.width = outW_;
+        s.height = outH_;
+        {
+            std::lock_guard<std::mutex> lock(errorMutex_);
+            s.error = lastError_;
+        }
+        s.presented = presented_;
+        s.skipped = skipped_;
+        s.failed = failed_;
+        {
+            std::lock_guard<std::mutex> lock(rateMutex_);
+            s.fps = rate_.rate(util::nowMs());
+        }
+        return s;
+    }
+
+    void requestPreview() override { previewRequestedMs_ = util::nowMs(); }
+
+    std::optional<std::string> previewJpeg() const override {
+        std::lock_guard<std::mutex> lock(previewMutex_);
+        if (previewJpeg_.empty()) return std::nullopt;
+        return previewJpeg_;
+    }
+
+    void onUserClosed(std::function<void()> cb) override { onUserClosed_ = std::move(cb); }
+
+private:
+    void setError(const std::string& e) {
+        std::lock_guard<std::mutex> lock(errorMutex_);
+        if (!e.empty() && e != lastError_) LOG_WARN("capture", "output: ", e);
+        lastError_ = e;
+    }
+
+    // ---------------------------------------------------------------- setup
+    bool createDevice(std::string& error) {
+        const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1,
+                                            D3D_FEATURE_LEVEL_10_0};
+        HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                                       levels, 4, D3D11_SDK_VERSION, device_.put(), nullptr, context_.put());
+        if (hr == E_INVALIDARG) // Windows 7 runtime without 11_1
+            hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                                   levels + 1, 3, D3D11_SDK_VERSION, device_.put(), nullptr, context_.put());
+        if (FAILED(hr)) {
+            error = "No Direct3D 10/11 GPU available (" + hex(hr) + ")";
+            return false;
+        }
+        return true;
+    }
+
+    bool createPipeline(std::string& error) {
+        HMODULE compiler = LoadLibraryW(L"d3dcompiler_47.dll"); // in-box since Windows 8.1
+        auto compile = compiler ? reinterpret_cast<D3DCompileFn>(
+                                      reinterpret_cast<void*>(GetProcAddress(compiler, "D3DCompile")))
+                                : nullptr;
+        if (!compile) {
+            error = "d3dcompiler_47.dll is missing (install the Windows updates / DirectX runtime)";
+            return false;
+        }
+        auto build = [&](const char* entry, const char* target, ComRef<ID3DBlob>& out) {
+            ComRef<ID3DBlob> errors;
+            HRESULT hr = compile(kShaderSource, sizeof(kShaderSource) - 1, "usc_capture", nullptr, nullptr, entry,
+                                 target, 0, 0, out.put(), errors.put());
+            if (FAILED(hr)) {
+                error = std::string("Shader ") + entry + " failed: " +
+                        (errors ? std::string(static_cast<const char*>(errors->GetBufferPointer()),
+                                              errors->GetBufferSize())
+                                : hex(hr));
+                return false;
+            }
+            return true;
+        };
+        ComRef<ID3DBlob> vs, psNv12, psYuy2;
+        bool ok = build("vsMain", "vs_4_0", vs) && build("psNV12", "ps_4_0", psNv12) &&
+                  build("psYUY2", "ps_4_0", psYuy2);
+        FreeLibrary(compiler);
+        if (!ok) return false;
+        HRESULT hr = device_->CreateVertexShader(vs->GetBufferPointer(), vs->GetBufferSize(), nullptr, vs_.put());
+        if (SUCCEEDED(hr))
+            hr = device_->CreatePixelShader(psNv12->GetBufferPointer(), psNv12->GetBufferSize(), nullptr,
+                                            psNv12_.put());
+        if (SUCCEEDED(hr))
+            hr = device_->CreatePixelShader(psYuy2->GetBufferPointer(), psYuy2->GetBufferSize(), nullptr,
+                                            psYuy2_.put());
+        D3D11_SAMPLER_DESC sd{};
+        sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+        sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+        sd.MaxLOD = D3D11_FLOAT32_MAX;
+        if (SUCCEEDED(hr)) hr = device_->CreateSamplerState(&sd, sampler_.put());
+        D3D11_BUFFER_DESC bd{};
+        bd.ByteWidth = sizeof(ColorRows);
+        bd.Usage = D3D11_USAGE_DEFAULT;
+        bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        if (SUCCEEDED(hr)) hr = device_->CreateBuffer(&bd, nullptr, colorBuffer_.put());
+        if (FAILED(hr)) {
+            error = "Could not create the GPU colour converter (" + hex(hr) + ")";
+            return false;
+        }
+        colorFor709_ = -1;
+        return true;
+    }
+
+    bool createSwapChain(std::string& error) {
         ComRef<IDXGIDevice> dxgiDevice;
         ComRef<IDXGIAdapter> adapter;
         ComRef<IDXGIFactory2> factory;
-        hr = device_->QueryInterface(__uuidof(IDXGIDevice), dxgiDevice.putVoid());
+        HRESULT hr = device_->QueryInterface(__uuidof(IDXGIDevice), dxgiDevice.putVoid());
         if (SUCCEEDED(hr)) hr = dxgiDevice->GetAdapter(adapter.put());
         if (SUCCEEDED(hr)) hr = adapter->GetParent(__uuidof(IDXGIFactory2), factory.putVoid());
         DXGI_SWAP_CHAIN_DESC1 sd{};
-        sd.Width = UINT(outW);
-        sd.Height = UINT(outH);
+        sd.Width = UINT(outW_);
+        sd.Height = UINT(outH_);
         sd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
         sd.SampleDesc.Count = 1;
         sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
@@ -131,110 +371,257 @@ public:
             }
         }
         if (SUCCEEDED(hr)) factory->MakeWindowAssociation(hwnd_, DXGI_MWA_NO_ALT_ENTER);
-        if (SUCCEEDED(hr)) hr = swapChain_->GetBuffer(0, __uuidof(ID3D11Texture2D), backBuffer_.putVoid());
+        if (SUCCEEDED(hr)) {
+            ComRef<IDXGIDevice1> d1;
+            if (SUCCEEDED(device_->QueryInterface(__uuidof(IDXGIDevice1), d1.putVoid())))
+                d1->SetMaximumFrameLatency(1); // newest frame on screen, not 3 frames behind
+        }
+        ComRef<ID3D11Texture2D> back;
+        if (SUCCEEDED(hr)) hr = swapChain_->GetBuffer(0, __uuidof(ID3D11Texture2D), back.putVoid());
+        if (SUCCEEDED(hr)) hr = device_->CreateRenderTargetView(back.get(), nullptr, backBufferRtv_.put());
         if (FAILED(hr)) {
             error = "Could not create the output swap chain (" + hex(hr) + ")";
-            close();
             return false;
         }
-        // Valid (black) content right away, so OBS finds a hookable window
-        // even before the first frame arrives.
-        clearBackBuffer();
-        swapChain_->Present(0, 0);
-        open_ = true;
-        LOG_INFO("capture", "output window ", outW, "x", outH, " ready");
         return true;
     }
 
-    bool present(const FrameView& f) override {
-        std::vector<uint8_t> previewPixels; // BGR24, encoded after unlocking
-        bool ok = false;
-        {
-            std::lock_guard<std::mutex> lock(deviceMutex_);
-            if (!swapChain_ || !f.data || f.width <= 0 || f.height <= 0) return false;
-            if (!ensureInput(f) || !upload(f)) return false;
-            if (!ensureProcessor(main_, f.width, f.height, outW_, outH_) || !ensureOutputView()) return false;
-            blit(main_, outputView_.get(), f.width, f.height, outW_, outH_, keepAspect_);
-            HRESULT hr = swapChain_->Present(0, DXGI_PRESENT_DO_NOT_WAIT);
-            if (hr == DXGI_ERROR_WAS_STILL_DRAWING) {
-                ok = false; // GPU busy: drop rather than block the capture thread
-            } else if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) {
-                lastError_ = "The GPU was reset (driver update / sleep) - restart the relay";
-                ok = false;
+    void releaseAll() {
+        texY_.reset();
+        texUV_.reset();
+        texP_.reset();
+        srvY_.reset();
+        srvUV_.reset();
+        srvP_.reset();
+        previewTex_.reset();
+        previewRtv_.reset();
+        previewStaging_.reset();
+        colorBuffer_.reset();
+        sampler_.reset();
+        psYuy2_.reset();
+        psNv12_.reset();
+        vs_.reset();
+        backBufferRtv_.reset();
+        swapChain_.reset();
+        context_.reset();
+        device_.reset();
+        texW_ = texH_ = 0;
+        texFormat_.clear();
+    }
+
+    // ---------------------------------------------------------------- render thread
+    void renderThread() {
+        HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED); // WIC (preview JPEG)
+        CpuFrame current;
+        for (;;) {
+            {
+                std::unique_lock<std::mutex> lock(mailboxMutex_);
+                mailboxCv_.wait(lock, [&] { return quit_ || hasPending_; });
+                if (quit_) break;
+                std::swap(current, pending_);
+                hasPending_ = false;
+            }
+            if (renderFrame(current)) {
+                ++presented_;
+                std::lock_guard<std::mutex> lock(rateMutex_);
+                rate_.tick(util::nowMs());
             } else {
-                occluded_ = hr == DXGI_STATUS_OCCLUDED;
-                ok = SUCCEEDED(hr);
-            }
-            // Preview: only while requested recently, small and slow.
-            int64_t now = util::nowMs();
-            if (now - previewRequestedMs_ < kPreviewIdleMs && now - lastPreviewMs_ >= kPreviewIntervalMs) {
-                lastPreviewMs_ = now;
-                readPreview(f, previewPixels);
+                ++failed_;
             }
         }
-        if (!previewPixels.empty()) {
-            std::string jpeg = encodeJpeg(previewPixels, kPreviewW, kPreviewH);
-            if (!jpeg.empty()) {
-                std::lock_guard<std::mutex> lock(previewMutex_);
-                previewJpeg_ = std::move(jpeg);
+        if (SUCCEEDED(co)) CoUninitialize();
+    }
+
+    bool ensureTextures(const CpuFrame& f) {
+        if (texW_ == f.width && texH_ == f.height && texFormat_ == f.subtype) return true;
+        texY_.reset();
+        texUV_.reset();
+        texP_.reset();
+        srvY_.reset();
+        srvUV_.reset();
+        srvP_.reset();
+        texW_ = texH_ = 0;
+        auto make = [&](int w, int h, DXGI_FORMAT fmt, ComRef<ID3D11Texture2D>& tex,
+                        ComRef<ID3D11ShaderResourceView>& srv) {
+            D3D11_TEXTURE2D_DESC td{};
+            td.Width = UINT(w);
+            td.Height = UINT(h);
+            td.MipLevels = 1;
+            td.ArraySize = 1;
+            td.Format = fmt;
+            td.SampleDesc.Count = 1;
+            td.Usage = D3D11_USAGE_DEFAULT;
+            td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            HRESULT hr = device_->CreateTexture2D(&td, nullptr, tex.put());
+            if (SUCCEEDED(hr)) hr = device_->CreateShaderResourceView(tex.get(), nullptr, srv.put());
+            if (FAILED(hr))
+                setError("Could not create a " + std::to_string(w) + "x" + std::to_string(h) + " GPU texture (" +
+                         hex(hr) + ")");
+            return SUCCEEDED(hr);
+        };
+        bool ok;
+        if (f.subtype == "NV12")
+            ok = make(f.width, f.height, DXGI_FORMAT_R8_UNORM, texY_, srvY_) &&
+                 make((f.width + 1) / 2, (f.height + 1) / 2, DXGI_FORMAT_R8G8_UNORM, texUV_, srvUV_);
+        else
+            ok = make((f.width + 1) / 2, f.height, DXGI_FORMAT_R8G8B8A8_UNORM, texP_, srvP_);
+        if (!ok) return false;
+        texW_ = f.width;
+        texH_ = f.height;
+        texFormat_ = f.subtype;
+        return true;
+    }
+
+    void bindAndDraw(ID3D11RenderTargetView* rtv, int targetW, int targetH, bool keepAspect, const CpuFrame& f) {
+        const float black[4] = {0, 0, 0, 1};
+        context_->ClearRenderTargetView(rtv, black);
+        D3D11_VIEWPORT vp{};
+        vp.Width = float(targetW);
+        vp.Height = float(targetH);
+        vp.MaxDepth = 1.0f;
+        if (keepAspect) { // letterbox / pillarbox
+            double s = std::min(double(targetW) / f.width, double(targetH) / f.height);
+            vp.Width = float(std::round(f.width * s));
+            vp.Height = float(std::round(f.height * s));
+            vp.TopLeftX = float(std::floor((targetW - vp.Width) / 2));
+            vp.TopLeftY = float(std::floor((targetH - vp.Height) / 2));
+        }
+        context_->OMSetRenderTargets(1, &rtv, nullptr);
+        context_->RSSetViewports(1, &vp);
+        context_->IASetInputLayout(nullptr);
+        context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        context_->VSSetShader(vs_.get(), nullptr, 0);
+        ID3D11Buffer* cb = colorBuffer_.get();
+        context_->PSSetConstantBuffers(0, 1, &cb);
+        ID3D11SamplerState* smp = sampler_.get();
+        context_->PSSetSamplers(0, 1, &smp);
+        if (f.subtype == "NV12") {
+            ID3D11ShaderResourceView* srvs[2] = {srvY_.get(), srvUV_.get()};
+            context_->PSSetShaderResources(0, 2, srvs);
+            context_->PSSetShader(psNv12_.get(), nullptr, 0);
+        } else {
+            ID3D11ShaderResourceView* srvs[3] = {nullptr, nullptr, srvP_.get()};
+            context_->PSSetShaderResources(0, 3, srvs);
+            context_->PSSetShader(psYuy2_.get(), nullptr, 0);
+        }
+        context_->Draw(3, 0);
+        ID3D11ShaderResourceView* none[3] = {nullptr, nullptr, nullptr};
+        context_->PSSetShaderResources(0, 3, none);
+    }
+
+    bool renderFrame(const CpuFrame& f) {
+        if (!ensureTextures(f)) return false;
+        // Upload: one copy per plane, straight from the packed CPU buffers.
+        if (f.subtype == "NV12") {
+            context_->UpdateSubresource(texY_.get(), 0, nullptr, f.plane0.data(), UINT(f.pitch), 0);
+            context_->UpdateSubresource(texUV_.get(), 0, nullptr, f.plane1.data(), UINT(f.pitch), 0);
+        } else {
+            context_->UpdateSubresource(texP_.get(), 0, nullptr, f.plane0.data(), UINT(f.pitch), 0);
+        }
+        int want709 = f.height >= 720 ? 1 : 0; // BT.709 for HD, BT.601 for SD
+        if (want709 != colorFor709_) {
+            ColorRows rows = colorRows(want709 == 1);
+            context_->UpdateSubresource(colorBuffer_.get(), 0, nullptr, &rows, 0, 0);
+            colorFor709_ = want709;
+        }
+
+        bindAndDraw(backBufferRtv_.get(), outW_, outH_, keepAspect_, f);
+        // Blocking Present on this dedicated thread: with frame latency 1 it
+        // waits at most about one refresh; the capture thread is never held up.
+        HRESULT hr = swapChain_->Present(0, 0);
+        if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) {
+            setError("The GPU was reset (driver update / sleep) - press Stop, then Start (" +
+                     hex(device_->GetDeviceRemovedReason()) + ")");
+            return false;
+        }
+        if (FAILED(hr)) {
+            setError("Present failed (" + hex(hr) + ")");
+            return false;
+        }
+        setError("");
+
+        int64_t now = util::nowMs();
+        if (now - previewRequestedMs_ < kPreviewIdleMs && now - lastPreviewMs_ >= kPreviewIntervalMs) {
+            lastPreviewMs_ = now;
+            makePreview(f);
+        }
+        return true;
+    }
+
+    void makePreview(const CpuFrame& f) {
+        if (!previewTex_) {
+            D3D11_TEXTURE2D_DESC td{};
+            td.Width = kPreviewW;
+            td.Height = kPreviewH;
+            td.MipLevels = 1;
+            td.ArraySize = 1;
+            td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            td.SampleDesc.Count = 1;
+            td.Usage = D3D11_USAGE_DEFAULT;
+            td.BindFlags = D3D11_BIND_RENDER_TARGET;
+            if (FAILED(device_->CreateTexture2D(&td, nullptr, previewTex_.put()))) return;
+            if (FAILED(device_->CreateRenderTargetView(previewTex_.get(), nullptr, previewRtv_.put()))) return;
+            td.Usage = D3D11_USAGE_STAGING;
+            td.BindFlags = 0;
+            td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            if (FAILED(device_->CreateTexture2D(&td, nullptr, previewStaging_.put()))) return;
+        }
+        bindAndDraw(previewRtv_.get(), kPreviewW, kPreviewH, true, f);
+        context_->CopyResource(previewStaging_.get(), previewTex_.get());
+        D3D11_MAPPED_SUBRESOURCE map{};
+        if (FAILED(context_->Map(previewStaging_.get(), 0, D3D11_MAP_READ, 0, &map))) return;
+        std::vector<uint8_t> bgr(size_t(kPreviewW) * kPreviewH * 3);
+        for (int y = 0; y < kPreviewH; ++y) {
+            const uint8_t* row = static_cast<const uint8_t*>(map.pData) + size_t(y) * map.RowPitch;
+            uint8_t* dst = bgr.data() + size_t(y) * kPreviewW * 3;
+            for (int x = 0; x < kPreviewW; ++x) {
+                dst[x * 3 + 0] = row[x * 4 + 0];
+                dst[x * 3 + 1] = row[x * 4 + 1];
+                dst[x * 3 + 2] = row[x * 4 + 2];
             }
         }
-        return ok;
+        context_->Unmap(previewStaging_.get(), 0);
+        std::string jpeg = encodeJpeg(bgr, kPreviewW, kPreviewH);
+        if (!jpeg.empty()) {
+            std::lock_guard<std::mutex> lock(previewMutex_);
+            previewJpeg_ = std::move(jpeg);
+        }
     }
 
-    void close() override {
-        {
-            std::lock_guard<std::mutex> lock(deviceMutex_);
-            open_ = false;
-            outputView_.reset();
-            inputView_.reset();
-            inputTexture_.reset();
-            previewView_.reset();
-            previewInputView_.reset();
-            previewInputFor_ = nullptr;
-            previewTexture_.reset();
-            previewStaging_.reset();
-            main_ = Processor{};
-            preview_ = Processor{};
-            backBuffer_.reset();
-            if (context_) {
-                context_->ClearState();
-                context_->Flush();
+    static std::string encodeJpeg(const std::vector<uint8_t>& bgr, int w, int h) {
+        std::string out;
+        ComRef<IWICImagingFactory> factory;
+        ComRef<IStream> stream;
+        ComRef<IWICBitmapEncoder> encoder;
+        ComRef<IWICBitmapFrameEncode> frame;
+        ComRef<IPropertyBag2> props;
+        HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                                      __uuidof(IWICImagingFactory), factory.putVoid());
+        if (SUCCEEDED(hr)) hr = CreateStreamOnHGlobal(nullptr, TRUE, stream.put());
+        if (SUCCEEDED(hr)) hr = factory->CreateEncoder(GUID_ContainerFormatJpeg, nullptr, encoder.put());
+        if (SUCCEEDED(hr)) hr = encoder->Initialize(stream.get(), WICBitmapEncoderNoCache);
+        if (SUCCEEDED(hr)) hr = encoder->CreateNewFrame(frame.put(), props.put());
+        if (SUCCEEDED(hr)) hr = frame->Initialize(props.get());
+        if (SUCCEEDED(hr)) hr = frame->SetSize(UINT(w), UINT(h));
+        WICPixelFormatGUID fmt = GUID_WICPixelFormat24bppBGR;
+        if (SUCCEEDED(hr)) hr = frame->SetPixelFormat(&fmt);
+        if (SUCCEEDED(hr))
+            hr = frame->WritePixels(UINT(h), UINT(w * 3), UINT(bgr.size()), const_cast<BYTE*>(bgr.data()));
+        if (SUCCEEDED(hr)) hr = frame->Commit();
+        if (SUCCEEDED(hr)) hr = encoder->Commit();
+        HGLOBAL global = nullptr;
+        STATSTG st{};
+        if (SUCCEEDED(hr)) hr = GetHGlobalFromStream(stream.get(), &global);
+        if (SUCCEEDED(hr)) hr = stream->Stat(&st, STATFLAG_NONAME);
+        if (SUCCEEDED(hr)) {
+            if (void* p = GlobalLock(global)) {
+                out.assign(static_cast<const char*>(p), size_t(st.cbSize.QuadPart));
+                GlobalUnlock(global);
             }
-            swapChain_.reset(); // before the window goes away
         }
-        closeWindow();
-        releaseDevice();
-        std::lock_guard<std::mutex> lock(previewMutex_);
-        previewJpeg_.clear();
+        return out;
     }
 
-    OutputState state() const override {
-        OutputState s;
-        s.open = open_;
-        HWND h = hwnd_;
-        if (h) {
-            s.visible = IsWindowVisible(h) != FALSE;
-            s.minimized = IsIconic(h) != FALSE;
-        }
-        s.width = outW_;
-        s.height = outH_;
-        std::lock_guard<std::mutex> lock(deviceMutex_);
-        s.error = lastError_;
-        return s;
-    }
-
-    void requestPreview() override { previewRequestedMs_ = util::nowMs(); }
-
-    std::optional<std::string> previewJpeg() const override {
-        std::lock_guard<std::mutex> lock(previewMutex_);
-        if (previewJpeg_.empty()) return std::nullopt;
-        return previewJpeg_;
-    }
-
-    void onUserClosed(std::function<void()> cb) override { onUserClosed_ = std::move(cb); }
-
-private:
     // ---------------------------------------------------------------- window
     static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         auto* self = reinterpret_cast<D3DOutputWindow*>(GetWindowLongPtrW(h, GWLP_USERDATA));
@@ -307,261 +694,6 @@ private:
         hwnd_ = nullptr;
     }
 
-    void releaseDevice() {
-        std::lock_guard<std::mutex> lock(deviceMutex_);
-        videoContext_.reset();
-        videoDevice_.reset();
-        context_.reset();
-        device_.reset();
-    }
-
-    // ---------------------------------------------------------------- d3d
-    void clearBackBuffer() {
-        ComRef<ID3D11RenderTargetView> rtv;
-        if (SUCCEEDED(device_->CreateRenderTargetView(backBuffer_.get(), nullptr, rtv.put()))) {
-            const float black[4] = {0, 0, 0, 1};
-            context_->ClearRenderTargetView(rtv.get(), black);
-        }
-    }
-
-    bool ensureInput(const FrameView& f) {
-        if (inputTexture_ && inW_ == f.width && inH_ == f.height && inFormat_ == f.subtype) return true;
-        inputView_.reset();
-        outputView_.reset();
-        previewView_.reset();
-        previewInputView_.reset(); // views of the old texture / processors
-        previewInputFor_ = nullptr;
-        inputTexture_.reset();
-        main_ = Processor{};
-        preview_ = Processor{};
-        D3D11_TEXTURE2D_DESC td{};
-        td.Width = UINT(f.width);
-        td.Height = UINT(f.height);
-        td.MipLevels = 1;
-        td.ArraySize = 1;
-        td.Format = dxgiFormat(f.subtype);
-        td.SampleDesc.Count = 1;
-        td.Usage = D3D11_USAGE_DEFAULT;
-        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        HRESULT hr = device_->CreateTexture2D(&td, nullptr, inputTexture_.put());
-        if (FAILED(hr)) { // some drivers only allow decoder-bound video surfaces
-            td.BindFlags = D3D11_BIND_DECODER;
-            hr = device_->CreateTexture2D(&td, nullptr, inputTexture_.put());
-        }
-        if (FAILED(hr)) {
-            lastError_ = "The GPU cannot hold " + f.subtype + " " + std::to_string(f.width) + "x" +
-                         std::to_string(f.height) + " frames (" + hex(hr) + ")";
-            return false;
-        }
-        inW_ = f.width;
-        inH_ = f.height;
-        inFormat_ = f.subtype;
-        return true;
-    }
-
-    bool upload(const FrameView& f) {
-        const uint8_t* src = f.data;
-        UINT pitch = UINT(f.pitch);
-        if (f.subtype == "NV12") {
-            size_t ySize = size_t(f.pitch) * size_t(f.height);
-            if (f.uvOffset != ySize) {
-                // Padded Y plane: make it contiguous (Y rows, then UV rows).
-                repack_.resize(ySize + ySize / 2);
-                std::memcpy(repack_.data(), f.data, ySize);
-                std::memcpy(repack_.data() + ySize, f.data + f.uvOffset, ySize / 2);
-                src = repack_.data();
-            }
-        }
-        context_->UpdateSubresource(inputTexture_.get(), 0, nullptr, src, pitch, 0);
-        return true;
-    }
-
-    bool ensureProcessor(Processor& p, int inW, int inH, int outW, int outH) {
-        if (p.processor && p.inW == inW && p.inH == inH && p.outW == outW && p.outH == outH) return true;
-        p = Processor{};
-        D3D11_VIDEO_PROCESSOR_CONTENT_DESC cd{};
-        cd.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
-        cd.InputWidth = UINT(inW);
-        cd.InputHeight = UINT(inH);
-        cd.OutputWidth = UINT(outW);
-        cd.OutputHeight = UINT(outH);
-        cd.InputFrameRate = {60, 1};
-        cd.OutputFrameRate = {60, 1};
-        cd.Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
-        HRESULT hr = videoDevice_->CreateVideoProcessorEnumerator(&cd, p.enumerator.put());
-        UINT support = 0;
-        if (SUCCEEDED(hr)) hr = p.enumerator->CheckVideoProcessorFormat(dxgiFormat(inFormat_), &support);
-        if (SUCCEEDED(hr) && !(support & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT)) hr = E_NOTIMPL;
-        if (SUCCEEDED(hr)) hr = videoDevice_->CreateVideoProcessor(p.enumerator.get(), 0, p.processor.put());
-        if (FAILED(hr)) {
-            lastError_ = "The GPU video processor cannot convert " + inFormat_ + " (" + hex(hr) + ")";
-            p = Processor{};
-            return false;
-        }
-        p.inW = inW;
-        p.inH = inH;
-        p.outW = outW;
-        p.outH = outH;
-        // Views depend on the enumerator.
-        if (&p == &main_) {
-            inputView_.reset();
-            outputView_.reset();
-        } else {
-            previewView_.reset();
-            previewInputView_.reset();
-            previewInputFor_ = nullptr;
-        }
-        D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC iv{};
-        iv.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
-        if (&p == &main_ &&
-            FAILED(hr = videoDevice_->CreateVideoProcessorInputView(inputTexture_.get(), p.enumerator.get(), &iv,
-                                                                    inputView_.put()))) {
-            lastError_ = "Could not attach the frame to the video processor (" + hex(hr) + ")";
-            p = Processor{};
-            return false;
-        }
-        return true;
-    }
-
-    bool ensureOutputView() {
-        if (outputView_) return true;
-        D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC ov{};
-        ov.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
-        HRESULT hr = videoDevice_->CreateVideoProcessorOutputView(backBuffer_.get(), main_.enumerator.get(), &ov,
-                                                                  outputView_.put());
-        if (FAILED(hr)) lastError_ = "Could not render into the output window (" + hex(hr) + ")";
-        return SUCCEEDED(hr);
-    }
-
-    void blit(Processor& p, ID3D11VideoProcessorOutputView* target, int inW, int inH, int outW, int outH,
-              bool keepAspect) {
-        ID3D11VideoProcessor* vp = p.processor.get();
-        videoContext_->VideoProcessorSetStreamFrameFormat(vp, 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
-        videoContext_->VideoProcessorSetStreamAutoProcessingMode(vp, 0, FALSE); // no "enhancements"
-        D3D11_VIDEO_PROCESSOR_COLOR_SPACE in{};
-        in.YCbCr_Matrix = inH >= 720 ? 1 : 0; // BT.709 for HD, BT.601 for SD
-        in.Nominal_Range = D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_16_235;
-        videoContext_->VideoProcessorSetStreamColorSpace(vp, 0, &in);
-        D3D11_VIDEO_PROCESSOR_COLOR_SPACE out{};
-        out.Nominal_Range = D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_0_255;
-        videoContext_->VideoProcessorSetOutputColorSpace(vp, &out);
-
-        RECT src{0, 0, inW, inH};
-        RECT full{0, 0, outW, outH};
-        RECT dst = full;
-        if (keepAspect) { // letterbox / pillarbox
-            double s = std::min(double(outW) / inW, double(outH) / inH);
-            int w = int(inW * s), h = int(inH * s);
-            dst = RECT{(outW - w) / 2, (outH - h) / 2, (outW - w) / 2 + w, (outH - h) / 2 + h};
-        }
-        videoContext_->VideoProcessorSetStreamSourceRect(vp, 0, TRUE, &src);
-        videoContext_->VideoProcessorSetStreamDestRect(vp, 0, TRUE, &dst);
-        videoContext_->VideoProcessorSetOutputTargetRect(vp, TRUE, &full);
-        D3D11_VIDEO_COLOR black{};
-        black.RGBA.A = 1.0f;
-        videoContext_->VideoProcessorSetOutputBackgroundColor(vp, FALSE, &black);
-
-        D3D11_VIDEO_PROCESSOR_STREAM stream{};
-        stream.Enable = TRUE;
-        stream.pInputSurface = inputViewFor(p);
-        videoContext_->VideoProcessorBlt(vp, target, 0, 1, &stream);
-    }
-
-    ID3D11VideoProcessorInputView* inputViewFor(Processor& p) {
-        if (&p == &main_) return inputView_.get();
-        if (!previewInputView_ || previewInputFor_ != p.enumerator.get()) {
-            D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC iv{};
-            iv.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
-            previewInputView_.reset();
-            videoDevice_->CreateVideoProcessorInputView(inputTexture_.get(), p.enumerator.get(), &iv,
-                                                        previewInputView_.put());
-            previewInputFor_ = p.enumerator.get();
-        }
-        return previewInputView_.get();
-    }
-
-    void readPreview(const FrameView& f, std::vector<uint8_t>& bgr) {
-        if (!previewTexture_) {
-            D3D11_TEXTURE2D_DESC td{};
-            td.Width = kPreviewW;
-            td.Height = kPreviewH;
-            td.MipLevels = 1;
-            td.ArraySize = 1;
-            td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-            td.SampleDesc.Count = 1;
-            td.Usage = D3D11_USAGE_DEFAULT;
-            td.BindFlags = D3D11_BIND_RENDER_TARGET;
-            if (FAILED(device_->CreateTexture2D(&td, nullptr, previewTexture_.put()))) return;
-            td.Usage = D3D11_USAGE_STAGING;
-            td.BindFlags = 0;
-            td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-            if (FAILED(device_->CreateTexture2D(&td, nullptr, previewStaging_.put()))) return;
-        }
-        if (!ensureProcessor(preview_, f.width, f.height, kPreviewW, kPreviewH)) return;
-        if (!previewView_) {
-            D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC ov{};
-            ov.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
-            if (FAILED(videoDevice_->CreateVideoProcessorOutputView(previewTexture_.get(), preview_.enumerator.get(),
-                                                                    &ov, previewView_.put())))
-                return;
-        }
-        blit(preview_, previewView_.get(), f.width, f.height, kPreviewW, kPreviewH, true);
-        context_->CopyResource(previewStaging_.get(), previewTexture_.get());
-        D3D11_MAPPED_SUBRESOURCE map{};
-        if (FAILED(context_->Map(previewStaging_.get(), 0, D3D11_MAP_READ, 0, &map))) return;
-        bgr.resize(size_t(kPreviewW) * kPreviewH * 3);
-        for (int y = 0; y < kPreviewH; ++y) {
-            const uint8_t* row = static_cast<const uint8_t*>(map.pData) + size_t(y) * map.RowPitch;
-            uint8_t* dst = bgr.data() + size_t(y) * kPreviewW * 3;
-            for (int x = 0; x < kPreviewW; ++x) {
-                dst[x * 3 + 0] = row[x * 4 + 0];
-                dst[x * 3 + 1] = row[x * 4 + 1];
-                dst[x * 3 + 2] = row[x * 4 + 2];
-            }
-        }
-        context_->Unmap(previewStaging_.get(), 0);
-    }
-
-    std::string encodeJpeg(const std::vector<uint8_t>& bgr, int w, int h) {
-        // Capture callbacks run on Media Foundation's (MTA) threads; make
-        // sure COM is initialised on this one for WIC.
-        HRESULT coInit = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-        std::string out;
-        {
-            ComRef<IWICImagingFactory> factory;
-            ComRef<IStream> stream;
-            ComRef<IWICBitmapEncoder> encoder;
-            ComRef<IWICBitmapFrameEncode> frame;
-            ComRef<IPropertyBag2> props;
-            HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, __uuidof(IWICImagingFactory),
-                                          factory.putVoid());
-            if (SUCCEEDED(hr)) hr = CreateStreamOnHGlobal(nullptr, TRUE, stream.put());
-            if (SUCCEEDED(hr)) hr = factory->CreateEncoder(GUID_ContainerFormatJpeg, nullptr, encoder.put());
-            if (SUCCEEDED(hr)) hr = encoder->Initialize(stream.get(), WICBitmapEncoderNoCache);
-            if (SUCCEEDED(hr)) hr = encoder->CreateNewFrame(frame.put(), props.put());
-            if (SUCCEEDED(hr)) hr = frame->Initialize(props.get());
-            if (SUCCEEDED(hr)) hr = frame->SetSize(UINT(w), UINT(h));
-            WICPixelFormatGUID fmt = GUID_WICPixelFormat24bppBGR;
-            if (SUCCEEDED(hr)) hr = frame->SetPixelFormat(&fmt);
-            if (SUCCEEDED(hr))
-                hr = frame->WritePixels(UINT(h), UINT(w * 3), UINT(bgr.size()), const_cast<BYTE*>(bgr.data()));
-            if (SUCCEEDED(hr)) hr = frame->Commit();
-            if (SUCCEEDED(hr)) hr = encoder->Commit();
-            HGLOBAL global = nullptr;
-            STATSTG st{};
-            if (SUCCEEDED(hr)) hr = GetHGlobalFromStream(stream.get(), &global);
-            if (SUCCEEDED(hr)) hr = stream->Stat(&st, STATFLAG_NONAME);
-            if (SUCCEEDED(hr)) {
-                if (void* p = GlobalLock(global)) {
-                    out.assign(static_cast<const char*>(p), size_t(st.cbSize.QuadPart));
-                    GlobalUnlock(global);
-                }
-            }
-        }
-        if (SUCCEEDED(coInit)) CoUninitialize();
-        return out;
-    }
-
     // window
     std::thread ui_;
     std::atomic<HWND> hwnd_{nullptr};
@@ -570,33 +702,44 @@ private:
     bool windowReady_ = false;
     std::function<void()> onUserClosed_;
 
-    // d3d (guarded by deviceMutex_)
-    mutable std::mutex deviceMutex_;
+    // d3d: created in open(), then used only by the render thread
     ComRef<ID3D11Device> device_;
     ComRef<ID3D11DeviceContext> context_;
-    ComRef<ID3D11VideoDevice> videoDevice_;
-    ComRef<ID3D11VideoContext> videoContext_;
     ComRef<IDXGISwapChain1> swapChain_;
-    ComRef<ID3D11Texture2D> backBuffer_;
-    ComRef<ID3D11VideoProcessorOutputView> outputView_;
-    ComRef<ID3D11Texture2D> inputTexture_;
-    ComRef<ID3D11VideoProcessorInputView> inputView_;
-    Processor main_, preview_;
-    ComRef<ID3D11Texture2D> previewTexture_, previewStaging_;
-    ComRef<ID3D11VideoProcessorOutputView> previewView_;
-    ComRef<ID3D11VideoProcessorInputView> previewInputView_;
-    void* previewInputFor_ = nullptr;
-    std::vector<uint8_t> repack_;
-    int inW_ = 0, inH_ = 0;
-    std::string inFormat_;
+    ComRef<ID3D11RenderTargetView> backBufferRtv_;
+    ComRef<ID3D11VertexShader> vs_;
+    ComRef<ID3D11PixelShader> psNv12_, psYuy2_;
+    ComRef<ID3D11SamplerState> sampler_;
+    ComRef<ID3D11Buffer> colorBuffer_;
+    int colorFor709_ = -1;
+    ComRef<ID3D11Texture2D> texY_, texUV_, texP_;
+    ComRef<ID3D11ShaderResourceView> srvY_, srvUV_, srvP_;
+    int texW_ = 0, texH_ = 0;
+    std::string texFormat_;
+    ComRef<ID3D11Texture2D> previewTex_, previewStaging_;
+    ComRef<ID3D11RenderTargetView> previewRtv_;
     int outW_ = 0, outH_ = 0;
     bool keepAspect_ = true;
     std::atomic<bool> open_{false};
-    std::atomic<bool> occluded_{false};
+
+    // latest-frame mailbox (capture thread -> render thread)
+    std::thread render_;
+    std::mutex mailboxMutex_;
+    std::condition_variable mailboxCv_;
+    CpuFrame spare_, pending_; // spare_ is touched only by the capture thread
+    bool hasPending_ = false;
+    bool quit_ = false;
+
+    // stats
+    std::atomic<uint64_t> presented_{0}, skipped_{0}, failed_{0};
+    mutable std::mutex rateMutex_;
+    RateMeter rate_;
+    mutable std::mutex errorMutex_;
     std::string lastError_;
+
+    // preview
     std::atomic<int64_t> previewRequestedMs_{0};
     int64_t lastPreviewMs_ = 0;
-
     mutable std::mutex previewMutex_;
     std::string previewJpeg_;
 };

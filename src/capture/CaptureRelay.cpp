@@ -121,18 +121,19 @@ json CaptureRelay::snapshotLocked() const {
     j["selectedMode"] = selected_ ? selected_->toJson() : json(nullptr);
     j["deliveredFormat"] = delivered_ ? delivered_->subtype : "";
     j["output"] = {{"width", outW_}, {"height", outH_}, {"fpsCap", fpsCap_}, {"title", cfg_.windowTitle}};
+    OutputState os = output_->state();
     {
         std::lock_guard<std::mutex> s(statsMutex_);
         int64_t now = util::nowMs();
         j["measured"] = {{"captureFps", std::round(captureRate_.rate(now) * 10) / 10},
-                         {"outputFps", std::round(outputRate_.rate(now) * 10) / 10},
-                         {"frames", frames_},
-                         {"presented", presented_},
-                         {"dropped", dropped_},
-                         {"paced", paced_},
+                         {"outputFps", std::round(os.fps * 10) / 10},
+                         {"frames", frames_},          // received from the device
+                         {"presented", os.presented},  // drawn + presented (what OBS sees)
+                         {"skipped", os.skipped},      // replaced by a newer frame before drawing
+                         {"failed", os.failed + rejected_},
+                         {"paced", paced_},            // dropped on purpose by the FPS cap
                          {"lastFrameAgoMs", lastFrameMs_ ? now - lastFrameMs_ : -1}};
     }
-    OutputState os = output_->state();
     j["window"] = {{"open", os.open}, {"visible", os.visible}, {"minimized", os.minimized}, {"error", os.error}};
     j["devices"] = json::array();
     for (const auto& d : devices_) j["devices"].push_back({{"id", d.id}, {"name", d.name}});
@@ -384,8 +385,7 @@ void CaptureRelay::startSession() {
         std::lock_guard<std::mutex> s(statsMutex_);
         pacer_.reset(cap);
         captureRate_ = RateMeter{};
-        outputRate_ = RateMeter{};
-        frames_ = presented_ = dropped_ = paced_ = 0;
+        frames_ = rejected_ = paced_ = 0;
         lastFrameMs_ = 0;
         sessionStartMs_ = util::nowMs();
     }
@@ -468,13 +468,11 @@ void CaptureRelay::onFrame(const FrameView& f) {
         if (!show) ++paced_;
     }
     if (!show) return;
-    bool ok = output_->present(f); // GPU upload + convert + Present (never waits for vsync)
-    std::lock_guard<std::mutex> s(statsMutex_);
-    if (ok) {
-        ++presented_;
-        outputRate_.tick(now);
-    } else {
-        ++dropped_;
+    // Only copies the frame into the output's mailbox; its render thread
+    // draws and presents it (counted in OutputState).
+    if (!output_->present(f)) {
+        std::lock_guard<std::mutex> s(statsMutex_);
+        ++rejected_;
     }
 }
 

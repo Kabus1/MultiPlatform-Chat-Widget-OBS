@@ -161,6 +161,7 @@
 
     if (!st.supported) banner('error', st.devicesError || 'The capture relay needs Windows 10/11 (Media Foundation + Direct3D 11).');
     else if (st.state === 'error') banner('error', st.detail);
+    else if (st.window && st.window.error) banner('error', 'Output window: ' + st.window.error);
     else if (st.state === 'no-signal') banner('warn', st.detail);
     else if (st.state === 'running' && st.window && st.window.minimized)
       banner('warn', 'The output window is minimized - OBS Game Capture shows nothing while it is. Restore it (it can stay behind other windows).');
@@ -184,9 +185,12 @@
     const w = st.window || {};
     $('#w-state').textContent = !w.open ? 'closed' : w.minimized ? 'minimized ⚠' : w.visible ? 'open, capturable' : 'hidden ⚠';
     $('#w-frames').textContent = live ? `${meas.presented || 0} shown / ${meas.frames || 0} received` : '–';
-    $('#w-dropped').textContent = live ? `${meas.dropped || 0} (GPU busy) · ${meas.paced || 0} by FPS cap` : '–';
+    $('#w-dropped').textContent = live
+      ? `${meas.failed || 0} failed · ${meas.skipped || 0} replaced by a newer frame · ${meas.paced || 0} by FPS cap`
+      : '–';
     renderDevices();
     updatePreviewLoop();
+    updatePreviewText();
   }
 
   // ------------------------------------------------------------- preview
@@ -220,7 +224,22 @@
     $('#preview').src = url || '';
     $('#preview').hidden = !url;
     $('#preview-empty').hidden = !!url;
-    $('#preview-empty').textContent = st && st.state === 'running' ? 'Waiting for the first frame…' : 'No picture (relay is off)';
+    updatePreviewText();
+  }
+  // Kept in sync with every status update (it used to stay at "relay is off").
+  function updatePreviewText() {
+    const el = $('#preview-empty');
+    const s = st ? st.state : 'off';
+    const shown = st && st.measured ? st.measured.presented || 0 : 0;
+    el.textContent =
+      s === 'off' ? 'No picture (relay is off)'
+      : s === 'error' ? 'No picture (see the error above)'
+      : s === 'starting' ? 'Starting…'
+      : s === 'no-signal' ? 'No signal from the device'
+      : st.window && st.window.error ? 'Output problem (see above)'
+      : !$('#preview-on').checked ? 'Preview is off'
+      : shown === 0 ? 'Waiting for the first frame…'
+      : 'Loading preview…';
   }
 
   // ------------------------------------------------------------- wiring
