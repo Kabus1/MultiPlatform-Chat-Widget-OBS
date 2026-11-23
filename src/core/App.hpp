@@ -110,6 +110,7 @@ private:
 
     std::unique_ptr<capture::CaptureRelay> capture_;
     nlohmann::json captureConfig_;
+    bool captureAutoStart_ = false; // decided once at launch (autoStart + no crash marker)
 };
 
 } // namespace usc

@@ -44,10 +44,30 @@ App::App(const std::string& configDir, int portOverride)
                                         {"pusherCluster", KickClient::kDefaultPusherCluster}}}});
     settings_.save(); // writes defaults on first run so users can find the file
     for (const char* p : kPlatforms) status_[p] = {{"state", "disabled"}, {"detail", ""}};
+    // Safe start for the capture relay: it never starts by itself unless
+    // "autoStart" is on, and never after a run that died with the relay
+    // starting/running (crash marker). enabled=false is written to disk
+    // *before* anything touches a device, so a crash can't loop.
+    std::string marker = (std::filesystem::path(configDir) / "capture-session.marker").string();
+    bool crashedLastRun = capture::CaptureRelay::consumeCrashMarker(marker);
+    {
+        json cap = settings_.snapshot()["capture"];
+        bool autoStart = cap.is_object() && cap.contains("autoStart") && cap["autoStart"].is_boolean() &&
+                         cap["autoStart"].get<bool>();
+        bool wasEnabled = cap.is_object() && cap.contains("enabled") && cap["enabled"].is_boolean() &&
+                          cap["enabled"].get<bool>();
+        captureAutoStart_ = autoStart && wasEnabled && !crashedLastRun;
+        if (wasEnabled) settings_.applyPatch({{"capture", {{"enabled", false}}}});
+    }
     capture_ = std::make_unique<capture::CaptureRelay>(
         [this](const json& st) { hub_.publish("capture", st); },
-        // The user closed the output window: remember that, so it stays closed.
-        [this] { applySettings({{"capture", {{"enabled", false}}}}); });
+        // Window closed by the user / fatal error: remember it, so it stays off.
+        [this] { applySettings({{"capture", {{"enabled", false}}}}); }, marker);
+    if (crashedLastRun) {
+        LOG_WARN("capture", "previous run ended while the capture relay was active: not starting it automatically");
+        capture_->setNotice("The app closed unexpectedly while the capture relay was running last time, so it "
+                            "was not started again. Press Start to try again.");
+    }
 }
 
 App::~App() { shutdown(); }
@@ -59,8 +79,9 @@ void App::start() {
     for (const char* p : kPlatforms) restartPlatform(p);
     restartObs();
     capture_->start(); // idle (no thread wake-ups) until the relay is enabled
+    if (captureAutoStart_) settings_.applyPatch({{"capture", {{"enabled", true}}}});
     captureConfig_ = settings_.snapshot()["capture"];
-    capture_->apply(capture::RelayConfig::fromJson(captureConfig_));
+    capture_->apply(capture::RelayConfig::fromJson(captureConfig_)); // queued: never blocks start-up
 }
 
 void App::restartObs() {

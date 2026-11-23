@@ -1,5 +1,7 @@
 #include "capture/CaptureRelay.hpp"
 
+#include "capture/Guard.hpp"
+
 #include "core/Log.hpp"
 #include "core/Util.hpp"
 
@@ -8,6 +10,9 @@
 #endif
 
 #include <algorithm>
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <cmath>
 #include <chrono>
 
@@ -23,15 +28,66 @@ constexpr int kRetryFirstMs = 5000;
 constexpr int kRetryMaxMs = 30000;
 } // namespace
 
-CaptureRelay::CaptureRelay(std::function<void(const json&)> onStatus, std::function<void()> onUserClosed)
-    : onStatus_(std::move(onStatus)), onUserClosed_(std::move(onUserClosed)), backend_(createVideoBackend()),
-      output_(createOutputSink()) {
+CaptureRelay::CaptureRelay(std::function<void(const json&)> onStatus, std::function<void()> onDisabled,
+                           std::string markerPath)
+    : onStatus_(std::move(onStatus)), onDisabled_(std::move(onDisabled)), markerPath_(std::move(markerPath)),
+      backend_(createVideoBackend()), output_(createOutputSink()) {
     // The window thread only queues a command: it must never wait on the
     // worker, which joins the window thread when it closes the output.
     output_->onUserClosed([this] { push({CmdType::UserClosed, {}, ""}); });
 }
 
 CaptureRelay::~CaptureRelay() { stop(); }
+
+bool CaptureRelay::consumeCrashMarker(const std::string& markerPath) {
+    if (markerPath.empty()) return false;
+    std::error_code ec;
+    if (!std::filesystem::exists(markerPath, ec)) return false;
+    std::filesystem::remove(markerPath, ec);
+    return true;
+}
+
+void CaptureRelay::setNotice(const std::string& text) {
+    {
+        std::lock_guard<std::mutex> lock(stateMutex_);
+        if (state_ == "off") detail_ = text;
+    }
+    // Not published here: the worker may not run yet; status() returns it.
+}
+
+void CaptureRelay::setMarker(bool on) {
+    if (markerPath_.empty() || on == markerOn_) return;
+    std::error_code ec;
+    if (on) {
+        std::ofstream(markerPath_) << "capture relay session starting\n";
+    } else {
+        std::filesystem::remove(markerPath_, ec);
+    }
+    markerOn_ = on;
+}
+
+// Runs one unit of worker work. A C++ exception or (MSVC) a structured
+// exception inside a driver becomes an error in the UI: the relay switches
+// off and refuses new sessions until the app restarts, instead of crashing.
+void CaptureRelay::runGuarded(const char* what, const std::function<void()>& fn) {
+    std::string fault;
+    if (guarded(fn, fault)) return;
+    LOG_ERROR("capture", what, ": ", fault);
+    std::string ignored;
+    guarded([&] { stopSession(); }, ignored);
+    {
+        std::lock_guard<std::mutex> lock(stateMutex_);
+        faulted_ = true;
+        cfg_.enabled = false;
+        state_ = "error";
+        retryAtMs_ = 0;
+        detail_ = std::string("The capture relay stopped to keep the app running (") + what + ": " + fault +
+                  "). Restart the app to use it again.";
+    }
+    setMarker(false);
+    publish();
+    if (onDisabled_) guarded([&] { onDisabled_(); }, ignored);
+}
 
 void CaptureRelay::start() {
     std::lock_guard<std::mutex> lock(queueMutex_);
@@ -159,7 +215,7 @@ void CaptureRelay::run() {
     // Media Foundation objects created here are free-threaded (MTA).
     HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
 #endif
-    enumerateNow();
+    runGuarded("device scan", [&] { enumerateNow(); });
     publish();
     for (;;) {
         std::optional<Cmd> cmd;
@@ -183,15 +239,13 @@ void CaptureRelay::run() {
         }
         if (cmd) {
             if (cmd->type == CmdType::Quit) break;
-            try {
-                handle(*cmd);
-            } catch (const std::exception& e) {
-                fail(std::string("Internal error: ") + e.what(), false);
-            }
+            runGuarded("command", [&] { handle(*cmd); });
         }
-        tick();
+        runGuarded("watchdog", [&] { tick(); });
     }
-    stopSession();
+    std::string ignored;
+    guarded([&] { stopSession(); }, ignored);
+    setMarker(false);
 #ifdef _WIN32
     if (SUCCEEDED(co)) CoUninitialize();
 #endif
@@ -203,6 +257,11 @@ void CaptureRelay::handle(const Cmd& c) {
         bool restart;
         {
             std::lock_guard<std::mutex> lock(stateMutex_);
+            if (faulted_) { // stays off until the app restarts (detail explains why)
+                cfg_ = c.cfg;
+                cfg_.enabled = false;
+                return;
+            }
             restart = !cfg_.sameSession(c.cfg) || (c.cfg.enabled && state_ == "error");
             cfg_ = c.cfg;
             if (restart) {
@@ -259,7 +318,7 @@ void CaptureRelay::handle(const Cmd& c) {
             detail_ = "Output window closed";
         }
         publish();
-        if (onUserClosed_) onUserClosed_(); // persists enabled=false (re-enters apply(): a no-op)
+        if (onDisabled_) onDisabled_(); // persists enabled=false (re-enters apply(): a no-op)
         return;
     case CmdType::Quit:
         return;
@@ -294,6 +353,20 @@ void CaptureRelay::tick() {
                 changed = true;
             }
             doPublish = changed || now - lastPublishMs_ >= kStatsPublishMs;
+        }
+    }
+    // The renderer hit a fatal error (it stopped itself): end the session.
+    bool open;
+    {
+        std::lock_guard<std::mutex> lock(stateMutex_);
+        open = sessionOpen_;
+    }
+    if (open) {
+        OutputState os = output_->state();
+        if (os.faulted) {
+            stopSession();
+            fail(os.error.empty() ? "The output window stopped rendering" : os.error, false);
+            return;
         }
     }
     if (doRetry) {
@@ -335,6 +408,9 @@ std::vector<Mode> CaptureRelay::modesFor(const std::string& deviceId, std::strin
 
 void CaptureRelay::startSession() {
     RelayConfig cfg;
+    // Crash marker: present for as long as a session is starting or open. If
+    // the process dies, the next launch finds it and does not start again.
+    setMarker(true);
     {
         std::lock_guard<std::mutex> lock(stateMutex_);
         cfg = cfg_;
@@ -426,6 +502,7 @@ void CaptureRelay::stopSession() {
     // Order matters: stop frame delivery before the window/GPU go away.
     backend_->close();
     output_->close();
+    setMarker(false);
     std::lock_guard<std::mutex> lock(stateMutex_);
     selected_.reset();
     delivered_.reset();
@@ -439,6 +516,7 @@ void CaptureRelay::stopSession() {
 }
 
 void CaptureRelay::fail(const std::string& msg, bool retryable) {
+    setMarker(false); // a clean failure is not a crash
     {
         std::lock_guard<std::mutex> lock(stateMutex_);
         state_ = "error";

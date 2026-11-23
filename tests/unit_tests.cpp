@@ -1,5 +1,8 @@
 // Minimal self-contained unit tests (no network): run with `ctest` or directly.
+#include "capture/CaptureRelay.hpp"
 #include "capture/CaptureTypes.hpp"
+#include "capture/Guard.hpp"
+#include "core/App.hpp"
 #include "core/BotFilter.hpp"
 #include "core/EmoteRegistry.hpp"
 #include "core/LanguageTools.hpp"
@@ -19,6 +22,9 @@
 
 #include <filesystem>
 #include <iostream>
+#include <thread>
+#include <atomic>
+#include <fstream>
 
 namespace {
 int failures = 0;
@@ -661,6 +667,86 @@ void testCaptureDecisions() {
     CHECK(!a.sameSession(b));
 }
 
+void testCaptureSafety() {
+    using namespace usc::capture;
+    namespace fs = std::filesystem;
+    // A hand-edited / damaged settings file never throws.
+    RelayConfig bad = RelayConfig::fromJson(
+        {{"enabled", "yes"}, {"deviceId", 5}, {"mode", nullptr}, {"outputFps", "120"}, {"keepAspect", 1}, {"windowTitle", ""}});
+    CHECK(!bad.enabled && bad.deviceId.empty() && bad.mode == "auto" && bad.outputFps == 0 && bad.keepAspect &&
+          bad.windowTitle == "USC Capture Output");
+    CHECK(RelayConfig::fromJson({{"outputFps", -5}}).outputFps == 0);
+    CHECK(!RelayConfig::fromJson(nullptr).enabled);
+
+    // The guard turns exceptions into errors.
+    std::string err;
+    CHECK(guarded([] {}, err) && err.empty());
+    CHECK(!guarded([] { throw std::runtime_error("boom"); }, err) && err.find("boom") != std::string::npos);
+    CHECK(!guarded([] { throw 42; }, err) && !err.empty());
+
+    // Start -> Stop -> Start cycles, destruction while active, crash marker.
+    fs::path dir = fs::temp_directory_path() / "usc_capture_test";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    std::string marker = (dir / "capture-session.marker").string();
+    {
+        std::atomic<int> disabled{0}, events{0};
+        CaptureRelay relay([&](const nlohmann::json&) { ++events; }, [&] { ++disabled; }, marker);
+        relay.start();
+        RelayConfig on;
+        on.enabled = true;
+        on.deviceId = "dev";
+        for (int i = 0; i < 5; ++i) {
+            relay.apply(on);
+            RelayConfig off = on;
+            off.enabled = false;
+            relay.apply(off);
+        }
+        relay.apply(on);
+        relay.refreshDevices();
+        relay.modes("dev");
+        for (int i = 0; i < 100 && relay.status()["state"] != "error"; ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        auto st = relay.status();
+        CHECK(st["state"] == "error"); // stub backend: a clean error, not a crash
+        CHECK(!st["supported"].get<bool>());
+        CHECK(!fs::exists(marker)); // a clean failure leaves no crash marker
+        CHECK(events > 0);
+        // destroyed while enabled
+    }
+    CHECK(!fs::exists(marker));
+    // A leftover marker (process died) is reported once.
+    { std::ofstream(marker) << "x"; }
+    CHECK(CaptureRelay::consumeCrashMarker(marker));
+    CHECK(!fs::exists(marker));
+    CHECK(!CaptureRelay::consumeCrashMarker(marker));
+
+    // App launch policy: a saved "enabled" never auto-starts by itself, and a
+    // crash marker blocks auto-start even when it is on.
+    auto writeSettings = [&](bool autoStart) {
+        nlohmann::json j = usc::Settings::defaults();
+        j["capture"]["enabled"] = true;
+        j["capture"]["autoStart"] = autoStart;
+        j["capture"]["deviceId"] = "dev";
+        std::ofstream(dir / "settings.json") << j.dump();
+    };
+    writeSettings(false);
+    {
+        usc::App app(dir.string(), 18799);
+        CHECK(app.settings().snapshot()["capture"]["enabled"] == false);
+        CHECK(app.settings().snapshot()["capture"]["deviceId"] == "dev"); // choices are kept
+    }
+    writeSettings(true);
+    { std::ofstream(marker) << "x"; }
+    {
+        usc::App app(dir.string(), 18799);
+        CHECK(app.settings().snapshot()["capture"]["enabled"] == false);
+        CHECK(app.capture().status()["detail"].get<std::string>().find("unexpectedly") != std::string::npos);
+        CHECK(!fs::exists(marker));
+    }
+    fs::remove_all(dir);
+}
+
 int main() {
     testTwitchParse();
     testKickParse();
@@ -681,6 +767,7 @@ int main() {
     testViewerConnection();
     testSettingsSanitize();
     testCaptureDecisions();
+    testCaptureSafety();
     if (failures) {
         std::cerr << failures << " check(s) failed\n";
         return 1;

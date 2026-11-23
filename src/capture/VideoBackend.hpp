@@ -16,6 +16,7 @@ namespace usc::capture {
 // callback). NV12: Y plane `height` rows, then the UV plane at `uvOffset`.
 struct FrameView {
     const uint8_t* data = nullptr;
+    size_t size = 0;        // bytes readable from `data` (consumers must stay inside)
     int pitch = 0;          // bytes per row
     size_t uvOffset = 0;    // NV12: byte offset of the UV plane
     int width = 0;

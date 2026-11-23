@@ -20,17 +20,37 @@ json Mode::toJson() const {
             {"subtype", subtype}, {"passThrough", isPassThrough(subtype)}};
 }
 
+namespace {
+// Settings come from a user-editable file: a wrong type falls back to the
+// default instead of throwing (json::value() throws on a type mismatch).
+bool getBool(const json& j, const char* k, bool d) {
+    auto it = j.find(k);
+    return it != j.end() && it->is_boolean() ? it->get<bool>() : d;
+}
+std::string getStr(const json& j, const char* k, const std::string& d) {
+    auto it = j.find(k);
+    return it != j.end() && it->is_string() ? it->get<std::string>() : d;
+}
+int getInt(const json& j, const char* k, int d) {
+    auto it = j.find(k);
+    if (it == j.end() || !it->is_number()) return d;
+    double v = it->get<double>();
+    return v < 0 ? 0 : v > 1000 ? 1000 : int(v);
+}
+} // namespace
+
 RelayConfig RelayConfig::fromJson(const json& j) {
     RelayConfig c;
     if (!j.is_object()) return c;
-    c.enabled = j.value("enabled", false);
-    c.deviceId = j.value("deviceId", "");
-    c.deviceName = j.value("deviceName", "");
-    c.mode = j.value("mode", std::string("auto"));
-    c.outputResolution = j.value("outputResolution", std::string("source"));
-    c.outputFps = std::max(0, j.value("outputFps", 0));
-    c.keepAspect = j.value("keepAspect", true);
-    c.windowTitle = j.value("windowTitle", std::string("USC Capture Output"));
+    c.enabled = getBool(j, "enabled", false);
+    c.deviceId = getStr(j, "deviceId", "");
+    c.deviceName = getStr(j, "deviceName", "");
+    c.mode = getStr(j, "mode", "auto");
+    if (c.mode.empty()) c.mode = "auto";
+    c.outputResolution = getStr(j, "outputResolution", "source");
+    c.outputFps = getInt(j, "outputFps", 0);
+    c.keepAspect = getBool(j, "keepAspect", true);
+    c.windowTitle = getStr(j, "windowTitle", "USC Capture Output");
     if (c.windowTitle.empty()) c.windowTitle = "USC Capture Output";
     return c;
 }

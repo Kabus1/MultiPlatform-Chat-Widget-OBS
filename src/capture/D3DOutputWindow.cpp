@@ -14,6 +14,7 @@
 #ifdef _WIN32
 
 #include "capture/ComRef.hpp"
+#include "capture/Guard.hpp"
 #include "capture/OutputSink.hpp"
 #include "core/Log.hpp"
 #include "core/Util.hpp"
@@ -98,6 +99,19 @@ float4 psYUY2(VO i) : SV_Target {
 typedef HRESULT(WINAPI* D3DCompileFn)(LPCVOID, SIZE_T, LPCSTR, const D3D_SHADER_MACRO*, ID3DInclude*, LPCSTR,
                                       LPCSTR, UINT, UINT, ID3DBlob**, ID3DBlob**);
 
+// d3dcompiler_47.dll is loaded once and never unloaded: the ID3DBlob objects
+// it returns live in that DLL, so FreeLibrary before releasing them (as an
+// earlier version did) jumped into unloaded code - an access violation on
+// every Start.
+D3DCompileFn d3dCompile() {
+    static D3DCompileFn fn = [] {
+        HMODULE m = LoadLibraryW(L"d3dcompiler_47.dll"); // in-box since Windows 8.1
+        return m ? reinterpret_cast<D3DCompileFn>(reinterpret_cast<void*>(GetProcAddress(m, "D3DCompile")))
+                 : nullptr;
+    }();
+    return fn;
+}
+
 // Limited-range YCbCr -> full-range RGB, as rows applied to (Y, Cb, Cr, 1).
 struct ColorRows {
     float r[4], g[4], b[4];
@@ -179,14 +193,21 @@ public:
             quit_ = false;
             hasPending_ = false;
         }
-        open_ = true;
+        faulted_ = false;
         render_ = std::thread([this] { renderThread(); });
+        {
+            std::lock_guard<std::mutex> input(inputMutex_);
+            open_ = true;
+        }
         LOG_INFO("capture", "output window ", outW, "x", outH, " ready");
         return true;
     }
 
     bool present(const FrameView& f) override {
-        if (!open_ || !f.data || f.width <= 0 || f.height <= 0 || f.pitch <= 0) return false;
+        // Serialised with open()/close(): a late capture callback can never
+        // write into the mailbox while the output is being torn down.
+        std::lock_guard<std::mutex> input(inputMutex_);
+        if (!open_ || faulted_ || !f.data || f.width <= 0 || f.height <= 0 || f.pitch <= 0) return false;
         // Copy into the spare buffer without holding the mailbox lock.
         CpuFrame& dst = spare_;
         dst.width = f.width;
@@ -197,9 +218,19 @@ public:
             size_t ySize = size_t(f.pitch) * size_t(f.height);
             size_t uvSize = size_t(f.pitch) * size_t((f.height + 1) / 2);
             size_t uvOff = f.uvOffset ? f.uvOffset : ySize;
+            if (size_t(f.pitch) < size_t(f.width) || uvOff < ySize || uvOff + uvSize > f.size) {
+                ++failed_;
+                setError("Frame buffer is smaller than its NV12 format says - frame skipped");
+                return false;
+            }
             dst.plane0.assign(f.data, f.data + ySize);
             dst.plane1.assign(f.data + uvOff, f.data + uvOff + uvSize);
         } else if (f.subtype == "YUY2") {
+            if (size_t(f.pitch) < size_t(f.width) * 2 || size_t(f.pitch) * size_t(f.height) > f.size) {
+                ++failed_;
+                setError("Frame buffer is smaller than its YUY2 format says - frame skipped");
+                return false;
+            }
             dst.plane0.assign(f.data, f.data + size_t(f.pitch) * size_t(f.height));
             dst.plane1.clear();
         } else {
@@ -218,7 +249,10 @@ public:
     }
 
     void close() override {
-        open_ = false;
+        {
+            std::lock_guard<std::mutex> input(inputMutex_); // waits for a present() in progress
+            open_ = false;
+        }
         {
             std::lock_guard<std::mutex> lock(mailboxMutex_);
             quit_ = true;
@@ -251,6 +285,7 @@ public:
             std::lock_guard<std::mutex> lock(errorMutex_);
             s.error = lastError_;
         }
+        s.faulted = faulted_;
         s.presented = presented_;
         s.skipped = skipped_;
         s.failed = failed_;
@@ -295,10 +330,7 @@ private:
     }
 
     bool createPipeline(std::string& error) {
-        HMODULE compiler = LoadLibraryW(L"d3dcompiler_47.dll"); // in-box since Windows 8.1
-        auto compile = compiler ? reinterpret_cast<D3DCompileFn>(
-                                      reinterpret_cast<void*>(GetProcAddress(compiler, "D3DCompile")))
-                                : nullptr;
+        D3DCompileFn compile = d3dCompile();
         if (!compile) {
             error = "d3dcompiler_47.dll is missing (install the Windows updates / DirectX runtime)";
             return false;
@@ -317,10 +349,9 @@ private:
             return true;
         };
         ComRef<ID3DBlob> vs, psNv12, psYuy2;
-        bool ok = build("vsMain", "vs_4_0", vs) && build("psNV12", "ps_4_0", psNv12) &&
-                  build("psYUY2", "ps_4_0", psYuy2);
-        FreeLibrary(compiler);
-        if (!ok) return false;
+        if (!build("vsMain", "vs_4_0", vs) || !build("psNV12", "ps_4_0", psNv12) ||
+            !build("psYUY2", "ps_4_0", psYuy2))
+            return false;
         HRESULT hr = device_->CreateVertexShader(vs->GetBufferPointer(), vs->GetBufferSize(), nullptr, vs_.put());
         if (SUCCEEDED(hr))
             hr = device_->CreatePixelShader(psNv12->GetBufferPointer(), psNv12->GetBufferSize(), nullptr,
@@ -421,7 +452,17 @@ private:
                 std::swap(current, pending_);
                 hasPending_ = false;
             }
-            if (renderFrame(current)) {
+            bool ok = false;
+            std::string fault;
+            if (!guarded([&] { ok = renderFrame(current); }, fault)) {
+                // A driver/GPU fault: stop drawing (the relay stops the session)
+                // instead of letting it take the whole app down.
+                ++failed_;
+                faulted_ = true;
+                setError("Rendering stopped: " + fault);
+                break;
+            }
+            if (ok) {
                 ++presented_;
                 std::lock_guard<std::mutex> lock(rateMutex_);
                 rate_.tick(util::nowMs());
@@ -721,6 +762,8 @@ private:
     int outW_ = 0, outH_ = 0;
     bool keepAspect_ = true;
     std::atomic<bool> open_{false};
+    std::atomic<bool> faulted_{false};
+    std::mutex inputMutex_; // present() vs open()/close()
 
     // latest-frame mailbox (capture thread -> render thread)
     std::thread render_;

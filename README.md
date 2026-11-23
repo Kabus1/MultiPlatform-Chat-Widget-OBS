@@ -264,6 +264,10 @@ capture.html ──HTTP/SSE──> WebServer ──> CaptureRelay (worker thread
   - The window gets black content immediately, before the first frame arrives.
   - The page warns when the window is minimized.
 - **No idle cost.** When the relay is off, its thread sleeps until a command arrives. The preview (640×360 at about 5 fps) is made only while the page is visible and asks for it.
+- **No crash loops.**
+  - The relay never starts by itself at launch unless *Start the relay when the app launches* is ticked (off by default).
+  - If the app closed unexpectedly while the relay was starting or running, that auto-start is skipped once and the page says why.
+  - Worker, capture callback and render thread are guarded. An exception (or, in MSVC builds, a fault inside a driver) switches the relay off with the error shown instead of closing the app.
 - **No UI blocking.** Every API call only queues work. If the device loses its signal, the status turns *No signal*; if it is unplugged, the relay retries with back-off (5 → 30 s) and finds it again by name on another USB port. Closing the output window stops the relay and saves that choice.
 
 ### Google Translate / TTS

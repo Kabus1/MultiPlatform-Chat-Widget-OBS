@@ -25,8 +25,18 @@ namespace usc::capture {
 class CaptureRelay {
 public:
     // onStatus: a status snapshot changed (published as the "capture" SSE event).
-    // onUserClosed: the user closed the output window -> persist enabled=false.
-    CaptureRelay(std::function<void(const nlohmann::json&)> onStatus, std::function<void()> onUserClosed);
+    // onDisabled: the relay turned itself off (window closed by the user, or a
+    //   fatal error) -> persist enabled=false so the next launch does not retry.
+    // markerPath: crash marker; exists only while a session is starting (and
+    //   for its first seconds). Found at launch = the app died while starting.
+    CaptureRelay(std::function<void(const nlohmann::json&)> onStatus, std::function<void()> onDisabled,
+                 std::string markerPath = "");
+
+    // True once (and clears it) if the previous run died while the relay was
+    // starting a session.
+    static bool consumeCrashMarker(const std::string& markerPath);
+    // Message shown in the relay's status until the next Start.
+    void setNotice(const std::string& text);
     ~CaptureRelay();
 
     void start();
@@ -59,11 +69,16 @@ private:
     void enumerateNow();
     std::vector<Mode> modesFor(const std::string& deviceId, std::string& error);
     void onFrame(const FrameView& f);
+    void runGuarded(const char* what, const std::function<void()>& fn);
+    void setMarker(bool on);
     nlohmann::json snapshotLocked() const;
     void publish();
 
     std::function<void(const nlohmann::json&)> onStatus_;
-    std::function<void()> onUserClosed_;
+    std::function<void()> onDisabled_;
+    std::string markerPath_;
+    bool markerOn_ = false;     // worker thread only
+    bool faulted_ = false;      // a crash was prevented: no new sessions until restart
     std::unique_ptr<VideoBackend> backend_;
     std::unique_ptr<OutputSink> output_;
 

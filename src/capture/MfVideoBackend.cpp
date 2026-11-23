@@ -2,6 +2,7 @@
 #ifdef _WIN32
 
 #include "capture/ComRef.hpp"
+#include "capture/Guard.hpp"
 #include "capture/VideoBackend.hpp"
 #include "core/Log.hpp"
 
@@ -119,7 +120,8 @@ struct Session {
     std::mutex mutex;
     std::condition_variable cv;
     bool running = false;
-    bool readPending = false;
+    bool readPending = false; // a ReadSample is outstanding
+    int inCallback = 0;       // OnReadSample is executing (close() waits for 0)
     ComRef<IMFSourceReader> reader;
     ComRef<IMFMediaSource> source;
     VideoBackend::FrameSink onFrame;
@@ -129,9 +131,15 @@ struct Session {
     int width = 0, height = 0;
     LONG defaultStride = 0;
 
+    ComRef<IMFSourceReader> currentReader() {
+        std::lock_guard<std::mutex> lock(mutex);
+        return reader; // AddRef'd copy: close() may drop its own reference meanwhile
+    }
+
     void readCurrentType() {
         ComRef<IMFMediaType> t;
-        if (SUCCEEDED(reader->GetCurrentMediaType(DWORD(MF_SOURCE_READER_FIRST_VIDEO_STREAM), t.put()))) {
+        ComRef<IMFSourceReader> r = currentReader();
+        if (r && SUCCEEDED(r->GetCurrentMediaType(DWORD(MF_SOURCE_READER_FIRST_VIDEO_STREAM), t.put()))) {
             Mode m;
             if (readMode(t.get(), m)) {
                 subtype = m.subtype;
@@ -145,20 +153,44 @@ struct Session {
     }
 
     bool requestNext() {
+        ComRef<IMFSourceReader> r;
         {
             std::lock_guard<std::mutex> lock(mutex);
-            if (!running) return false;
+            if (!running || !reader) return false;
+            r = reader;
             readPending = true;
         }
-        HRESULT hr = reader->ReadSample(DWORD(MF_SOURCE_READER_FIRST_VIDEO_STREAM), 0, nullptr, nullptr, nullptr, nullptr);
+        HRESULT hr = r->ReadSample(DWORD(MF_SOURCE_READER_FIRST_VIDEO_STREAM), 0, nullptr, nullptr, nullptr, nullptr);
         if (FAILED(hr)) {
-            std::lock_guard<std::mutex> lock(mutex);
-            readPending = false;
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                readPending = false;
+            }
             cv.notify_all();
             if (onError) onError(describe(hr, "Could not read from the device"));
             return false;
         }
         return true;
+    }
+
+    // Fills in the NV12 plane layout and checks that every byte a consumer
+    // will read lies inside the buffer. Returns false for a bad frame.
+    bool layout(FrameView& f) const {
+        if (!f.data || f.pitch <= 0 || f.width <= 0 || f.height <= 0) return false;
+        size_t pitch = size_t(f.pitch);
+        if (subtype == "YUY2") {
+            if (pitch < size_t(f.width) * 2) return false;
+            return pitch * size_t(f.height) <= f.size;
+        }
+        if (subtype != "NV12" || pitch < size_t(f.width)) return false;
+        size_t h = size_t(f.height), uvRows = (h + 1) / 2;
+        // Drivers may pad the Y plane (e.g. 1080 -> 1088 rows): the UV plane
+        // starts after all Y rows the buffer holds.
+        size_t totalRows = f.size / pitch;
+        size_t yRows = totalRows * 2 / 3;
+        if (yRows < h || yRows * pitch + uvRows * pitch > f.size) yRows = h;
+        f.uvOffset = yRows * pitch;
+        return f.uvOffset + uvRows * pitch <= f.size;
     }
 
     void deliver(IMFSample* sample, LONGLONG ts100ns) {
@@ -169,36 +201,49 @@ struct Session {
         f.height = height;
         f.subtype = subtype;
         f.timestampUs = ts100ns / 10;
-        ComRef<IMF2DBuffer> b2;
-        if (SUCCEEDED(buf->QueryInterface(__uuidof(IMF2DBuffer), b2.putVoid()))) {
+        ComRef<IMF2DBuffer2> b2;
+        ComRef<IMF2DBuffer> b1;
+        if (SUCCEEDED(buf->QueryInterface(__uuidof(IMF2DBuffer2), b2.putVoid()))) {
+            // Lock2DSize reports the real buffer extent next to the scanline pointer.
+            BYTE *scan0 = nullptr, *start = nullptr;
+            LONG pitch = 0;
+            DWORD length = 0;
+            if (FAILED(b2->Lock2DSize(MF2DBuffer_LockFlags_Read, &scan0, &pitch, &start, &length))) return;
+            if (scan0 && start && scan0 >= start && size_t(scan0 - start) <= length) {
+                f.data = scan0;
+                f.pitch = int(pitch);
+                f.size = size_t(length) - size_t(scan0 - start);
+                if (layout(f) && onFrame) onFrame(f);
+                else badFrames++;
+            }
+            b2->Unlock2D();
+        } else if (SUCCEEDED(buf->QueryInterface(__uuidof(IMF2DBuffer), b1.putVoid()))) {
             BYTE* scan0 = nullptr;
             LONG pitch = 0;
-            if (FAILED(b2->Lock2D(&scan0, &pitch))) return;
-            DWORD contiguous = 0;
-            b2->GetContiguousLength(&contiguous);
+            if (FAILED(b1->Lock2D(&scan0, &pitch))) return;
+            // Top-down planar/packed YUV: scan0 is the start of the buffer.
+            DWORD max = 0;
+            buf->GetMaxLength(&max);
             f.data = scan0;
             f.pitch = int(pitch);
-            if (subtype == "NV12" && pitch > 0) {
-                // Drivers may pad the Y plane (e.g. 1080 -> 1088 rows).
-                size_t rows = contiguous ? size_t(contiguous) / size_t(pitch) * 2 / 3 : size_t(height);
-                f.uvOffset = size_t(pitch) * std::max<size_t>(rows, size_t(height));
-            }
-            if (pitch > 0 && onFrame) onFrame(f);
-            b2->Unlock2D();
+            f.size = max;
+            if (pitch > 0 && layout(f) && onFrame) onFrame(f);
+            else badFrames++;
+            b1->Unlock2D();
         } else {
             BYTE* p = nullptr;
             DWORD maxLen = 0, len = 0;
             if (FAILED(buf->Lock(&p, &maxLen, &len))) return;
             f.data = p;
+            f.size = len;
             f.pitch = int(defaultStride > 0 ? defaultStride : (subtype == "YUY2" ? width * 2 : width));
-            if (subtype == "NV12") {
-                size_t rows = f.pitch ? size_t(len) / size_t(f.pitch) * 2 / 3 : size_t(height);
-                f.uvOffset = size_t(f.pitch) * std::max<size_t>(rows, size_t(height));
-            }
-            if (onFrame) onFrame(f);
+            if (layout(f) && onFrame) onFrame(f);
+            else badFrames++;
             buf->Unlock();
         }
     }
+
+    uint64_t badFrames = 0; // frames whose buffer did not match the format
 };
 
 class ReaderCallback : public IMFSourceReaderCallback {
@@ -228,20 +273,39 @@ public:
             std::lock_guard<std::mutex> lock(s.mutex);
             s.readPending = false;
             running = s.running;
+            if (running) ++s.inCallback; // close() waits until we are out
+        }
+        if (!running) {
+            s.cv.notify_all();
+            return S_OK;
+        }
+        // Nothing may escape into Media Foundation's thread: an exception or
+        // fault here would take the whole app down.
+        std::string fault;
+        guarded(
+            [&] {
+                if (FAILED(hr)) {
+                    if (s.onError) s.onError(describe(hr, "The device stopped delivering video"));
+                    return;
+                }
+                if (flags & (MF_SOURCE_READERF_ENDOFSTREAM | MF_SOURCE_READERF_ERROR)) {
+                    if (s.onError) s.onError("The device stopped delivering video (unplugged or taken by another app).");
+                    return;
+                }
+                if (flags & MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED) s.readCurrentType();
+                if (sample) s.deliver(sample, ts);
+                s.requestNext();
+            },
+            fault);
+        if (!fault.empty() && s.onError) {
+            std::string msg = "Frame handling failed: " + fault;
+            guarded([&] { s.onError(msg); }, fault);
+        }
+        {
+            std::lock_guard<std::mutex> lock(s.mutex);
+            --s.inCallback;
         }
         s.cv.notify_all();
-        if (!running) return S_OK;
-        if (FAILED(hr)) {
-            if (s.onError) s.onError(describe(hr, "The device stopped delivering video"));
-            return S_OK;
-        }
-        if (flags & (MF_SOURCE_READERF_ENDOFSTREAM | MF_SOURCE_READERF_ERROR)) {
-            if (s.onError) s.onError("The device stopped delivering video (unplugged or taken by another app).");
-            return S_OK;
-        }
-        if (flags & MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED) s.readCurrentType();
-        if (sample) s.deliver(sample, ts);
-        s.requestNext();
         return S_OK;
     }
     STDMETHODIMP OnFlush(DWORD) override { return S_OK; }
@@ -398,16 +462,22 @@ public:
             std::unique_lock<std::mutex> lock(s->mutex);
             s->running = false;
             // Let the in-flight read finish (at most one frame time)...
-            s->cv.wait_for(lock, std::chrono::milliseconds(1500), [&] { return !s->readPending; });
+            s->cv.wait_for(lock, std::chrono::milliseconds(1500), [&] { return !s->readPending && s->inCallback == 0; });
         }
         // ...then release the device. Shutdown also completes a read that is
         // stuck because the input has no signal.
         if (s->source) s->source->Shutdown();
         {
             std::unique_lock<std::mutex> lock(s->mutex);
-            s->cv.wait_for(lock, std::chrono::milliseconds(1500), [&] { return !s->readPending; });
+            s->cv.wait_for(lock, std::chrono::milliseconds(1500), [&] { return !s->readPending && s->inCallback == 0; });
         }
-        s->reader.reset();
+        // A callback that is still running past the timeouts keeps the Session
+        // (shared_ptr) alive; with running == false it no longer touches the
+        // reader, so releasing it here is safe.
+        {
+            std::lock_guard<std::mutex> lock(s->mutex);
+            s->reader.reset();
+        }
         s->source.reset();
     }
 

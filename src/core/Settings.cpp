@@ -58,7 +58,11 @@ json Settings::defaults() {
         {"capture", {
             // Video capture relay (Windows): one device -> a window OBS Game
             // Capture / TikTok Studio can capture without fighting over the device.
-            {"enabled", false},
+            {"enabled", false},   // on/off while the app runs
+            // Start the relay again when the app launches. Off by default, and
+            // ignored once if the previous run closed unexpectedly while the
+            // relay was starting/running (crash marker) - no crash loops.
+            {"autoStart", false},
             {"deviceId", ""},
             {"deviceName", ""},
             {"mode", "auto"},              // "auto" or "1920x1080@60/1:NV12"

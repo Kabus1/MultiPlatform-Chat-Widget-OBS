@@ -25,6 +25,7 @@ struct OutputState {
     uint64_t skipped = 0;   // replaced by a newer frame before they were drawn
     uint64_t failed = 0;    // could not be drawn (see `error`)
     double fps = 0;         // measured Present() rate
+    bool faulted = false;   // rendering hit a fatal error: the session must stop
 };
 
 class OutputSink {

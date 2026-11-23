@@ -118,6 +118,7 @@
     if (document.activeElement !== $('#out-res')) $('#out-res').value = cfg.outputResolution || 'source';
     if (document.activeElement !== $('#out-fps')) $('#out-fps').value = String(cfg.outputFps || 0);
     $('#keep-aspect').checked = cfg.keepAspect !== false;
+    $('#auto-start').checked = cfg.autoStart === true;
     if (document.activeElement !== $('#title')) $('#title').value = cfg.windowTitle || 'USC Capture Output';
     $('#title-code').textContent = `[UnifiedStreamChat.exe]: ${cfg.windowTitle || 'USC Capture Output'}`;
     loadModes(false);
@@ -260,6 +261,7 @@
   $('#out-res').addEventListener('change', (e) => save({ outputResolution: e.target.value }));
   $('#out-fps').addEventListener('change', (e) => save({ outputFps: Number(e.target.value) }));
   $('#keep-aspect').addEventListener('change', (e) => save({ keepAspect: e.target.checked }));
+  $('#auto-start').addEventListener('change', (e) => save({ autoStart: e.target.checked }));
   $('#title').addEventListener('change', (e) => {
     const t = e.target.value.trim() || 'USC Capture Output';
     save({ windowTitle: t }).then(renderSidebar);
