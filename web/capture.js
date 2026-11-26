@@ -274,17 +274,55 @@
     updatePreviewLoop();
   });
 
+  // ------------------------------------------------------------- TikTok feed (OBS)
+  let feed = null;
+  function renderFeed() {
+    if (!feed) return;
+    const pill = $('#feed-pill');
+    const ready = feed.obsConnected && feed.sceneReady;
+    pill.textContent = !feed.obsConnected ? 'OBS not connected' : feed.virtualCamActive ? 'Virtual Camera on' : ready ? 'Ready' : 'Not set up';
+    pill.className = 'pill ' + (!feed.obsConnected ? 'error' : feed.virtualCamActive ? 'ok' : ready ? 'running' : 'warn');
+    $('#f-obs').textContent = feed.obsConnected ? 'connected' : 'not connected - start OBS and enable its WebSocket server';
+    const sel = $('#f-source');
+    const opts = ['<option value="">Automatic</option>'];
+    for (const i of feed.inputs || [])
+      opts.push(`<option value="${esc(i.name)}"${i.name === feed.sourcePreferred ? ' selected' : ''}>${esc(i.name)}</option>`);
+    if (document.activeElement !== sel) sel.innerHTML = opts.join('');
+    $('#f-device').textContent = feed.source
+      ? `using "${feed.source}"${feed.sourceDevice ? ' (' + feed.sourceDevice + ')' : ''}`
+      : feed.obsConnected ? 'no Video Capture Device source in OBS yet' : '';
+    $('#f-scene').textContent = feed.sceneReady ? `"${feed.sceneName}" ready` : feed.enabled ? 'not ready (see message)' : 'not created yet';
+    $('#f-vcam').textContent = feed.virtualCamActive ? 'running - pick "OBS Virtual Camera" in TikTok Studio' : 'stopped';
+    $('#f-vcam-start').hidden = !!feed.virtualCamActive;
+    $('#f-vcam-stop').hidden = !feed.virtualCamActive;
+    $('#f-vcam-start').disabled = $('#f-setup').disabled = !feed.obsConnected;
+    $('#f-auto').checked = !!feed.autoStartVirtualCam;
+    $('#f-scene-name').textContent = $('#f-scene-name2').textContent = feed.sceneName || 'USC TikTok Feed';
+    const err = $('#f-error');
+    err.hidden = !feed.error;
+    err.textContent = feed.error || '';
+  }
+  $('#f-setup').addEventListener('click', () => api('/api/camfeed/setup', { method: 'POST' }).catch((e) => banner('error', e.message)));
+  $('#f-vcam-start').addEventListener('click', () => api('/api/camfeed/virtualcam?on=1', { method: 'POST' }).catch(() => {}));
+  $('#f-vcam-stop').addEventListener('click', () => api('/api/camfeed/virtualcam?on=0', { method: 'POST' }).catch(() => {}));
+  $('#f-auto').addEventListener('change', (e) =>
+    api('/api/settings', { method: 'POST', body: { camFeed: { autoStartVirtualCam: e.target.checked } } }).catch(() => {}));
+  $('#f-source').addEventListener('change', (e) =>
+    api('/api/settings', { method: 'POST', body: { camFeed: { sourceName: e.target.value } } }).catch(() => {}));
+
   async function init() {
     try {
       const s = await api('/api/settings');
       cfg = s.capture || {};
       if (s.ui && s.ui.theme && s.ui.theme !== 'transparent') document.documentElement.dataset.theme = s.ui.theme;
       st = await api('/api/capture/status');
+      feed = await api('/api/camfeed/status');
     } catch (e) {
       banner('error', 'The app is not reachable: ' + e.message);
     }
     renderSidebar();
     renderStatus();
+    renderFeed();
     showPreview('');
 
     const es = new EventSource('/api/events');
@@ -293,6 +331,10 @@
       st = JSON.parse(e.data);
       if (JSON.stringify(st.devices || []) !== prevDevices) loadModes(true);
       renderStatus();
+    });
+    es.addEventListener('camfeed', (e) => {
+      feed = JSON.parse(e.data);
+      renderFeed();
     });
     es.addEventListener('settings', (e) => {
       const c = JSON.parse(e.data).capture;

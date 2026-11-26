@@ -3,6 +3,11 @@
 #include "capture/CaptureTypes.hpp"
 #include "capture/Guard.hpp"
 #include "core/App.hpp"
+#include "core/EventHub.hpp"
+#include "integrations/ObsCameraFeed.hpp"
+#include "services/AudioPlayer.hpp"
+#include "services/TtsService.hpp"
+#include "services/Translator.hpp"
 #include "core/BotFilter.hpp"
 #include "core/EmoteRegistry.hpp"
 #include "core/LanguageTools.hpp"
@@ -747,6 +752,140 @@ void testCaptureSafety() {
     fs::remove_all(dir);
 }
 
+void testSpeechQueue() {
+    using nlohmann::json;
+    namespace fs = std::filesystem;
+    // One request per message: "name:" + message in one language.
+    json merged = usc::AudioPlayer::mergeSegments(
+        json::array({{{"text", "Ahmed:"}, {"lang", "en"}}, {{"text", "hello there"}, {"lang", "en"}},
+                     {{"text", "  "}, {"lang", "en"}}, {{"text", "مرحبا"}, {"lang", "ar"}}}));
+    CHECK(merged.size() == 2 && merged[0]["text"] == "Ahmed: hello there" && merged[1]["lang"] == "ar");
+    CHECK(usc::AudioPlayer::mergeSegments(nullptr).empty());
+
+    fs::path dir = fs::temp_directory_path() / "usc_speech_test";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    usc::Settings settings((dir / "settings.json").string());
+    settings.applyPatch({{"tts", {{"maxDelaySec", 2}, {"maxQueue", 10}}}, {"audio", {{"output", "app"}, {"muted", false}}}});
+    usc::TtsService tts;
+    usc::AudioPlayer player(settings, tts);
+    std::atomic<int> inFlight{0}, maxInFlight{0}, fetched{0};
+    std::mutex orderMutex;
+    std::vector<std::string> fetchOrder;
+    player.setSynthesizer([&](const std::string& text, const std::string&) -> std::optional<std::string> {
+        int now = ++inFlight;
+        int prev = maxInFlight.load();
+        while (now > prev && !maxInFlight.compare_exchange_weak(prev, now)) {}
+        {
+            std::lock_guard<std::mutex> lock(orderMutex);
+            fetchOrder.push_back(text);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        --inFlight;
+        ++fetched;
+        return std::string("not-an-mp3"); // playback fails fast: only the queue is under test
+    });
+    player.start();
+    auto waitFor = [&](auto pred, int ms) {
+        for (int i = 0; i < ms / 10 && !pred(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        return pred();
+    };
+
+    // Ordered slot: B (filled) waits behind A (still being translated).
+    uint64_t a = player.reserve(usc::util::nowMs());
+    player.enqueue(json::array({{{"text", "B"}, {"lang", "en"}}}));
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    CHECK(player.stats()["spoken"] == 0);
+    player.fill(a, json::array({{{"text", "A"}, {"lang", "en"}}}));
+    CHECK(waitFor([&] { return player.stats()["spoken"].get<int>() == 2; }, 3000));
+
+    // Prefetch: several messages are downloaded in parallel.
+    for (int i = 0; i < 4; ++i) player.enqueue(json::array({{{"text", "msg" + std::to_string(i)}, {"lang", "en"}}}));
+    CHECK(waitFor([&] { return player.stats()["spoken"].get<int>() == 6; }, 4000));
+    CHECK(maxInFlight >= 2);
+
+    // A slot with nothing to say is freed at once.
+    uint64_t empty = player.reserve(usc::util::nowMs());
+    player.fill(empty, nullptr);
+    CHECK(player.stats()["queued"] == 0);
+
+    // Stale: a message that arrived 5 s ago is skipped, not read late.
+    uint64_t old = player.reserve(usc::util::nowMs() - 5000);
+    player.fill(old, json::array({{{"text", "too late"}, {"lang", "en"}}}));
+    CHECK(waitFor([&] { return player.stats()["droppedStale"].get<int>() >= 1; }, 2000));
+    {
+        std::lock_guard<std::mutex> lock(orderMutex);
+        CHECK(std::find(fetchOrder.begin(), fetchOrder.end(), "too late") == fetchOrder.end() ||
+              player.stats()["droppedStale"].get<int>() >= 1);
+    }
+    player.stop();
+    fs::remove_all(dir);
+}
+
+void testDisplayFirstPipeline() {
+    using nlohmann::json;
+    namespace fs = std::filesystem;
+    fs::path dir = fs::temp_directory_path() / "usc_pipeline_test";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    usc::Settings settings((dir / "settings.json").string());
+    // Translation line wanted: the lookup goes to the network (slow or blocked here).
+    settings.applyPatch({{"translation", {{"enabled", true}, {"showForEnglish", true}, {"showForAllLanguages", true}}},
+                         {"tts", {{"enabled", false}}}});
+    usc::EventHub hub;
+    usc::Translator translator;
+    usc::MessagePipeline pipeline(settings, hub, translator);
+    auto sub = hub.subscribe();
+    pipeline.start();
+    usc::ChatMessage m;
+    m.platform = "twitch";
+    m.username = m.displayName = "viewer";
+    m.parts.push_back({usc::MessagePart::Type::Text, "good evening everyone", ""});
+    int64_t t0 = usc::util::nowMs();
+    pipeline.submit(m);
+    auto first = sub->next(1000);
+    CHECK(first && first->rfind("event: chat\n", 0) == 0);
+    CHECK(usc::util::nowMs() - t0 < 500); // shown before any network answer
+    // The update follows once the lookup ends (answer, error or timeout).
+    bool updated = false;
+    for (int i = 0; i < 20 && !updated; ++i) {
+        auto f = sub->next(500);
+        updated = f && f->rfind("event: chat-update\n", 0) == 0;
+    }
+    CHECK(updated);
+    pipeline.stop();
+
+    // History replay carries the updated message, without TTS.
+    usc::EventHub h2;
+    h2.publish("chat", {{"id", "x1"}, {"translation", ""}, {"tts", nullptr}}, true);
+    h2.updateChat({{"id", "x1"}, {"translation", "مساء الخير"}, {"tts", json::array({{{"text", "hi"}}})}});
+    auto late = h2.subscribe();
+    auto replay = late->next(100);
+    CHECK(replay && replay->find("مساء الخير") != std::string::npos && replay->find("\"tts\":null") != std::string::npos &&
+          replay->rfind("event: chat\n", 0) == 0);
+    fs::remove_all(dir);
+}
+
+void testObsFeedHelpers() {
+    using usc::ObsCameraFeed;
+    using nlohmann::json;
+    CHECK(ObsCameraFeed::isVideoCaptureKind("dshow_input") && !ObsCameraFeed::isVideoCaptureKind("game_capture"));
+    CHECK(ObsCameraFeed::deviceFromSettings("dshow_input",
+                                            {{"video_device_id", "Elgato 4K S:\\\\?\\usb#vid_0fd9&pid_009b#5&1"}}) ==
+          "Elgato 4K S");
+    CHECK(ObsCameraFeed::deviceFromSettings("dshow_input", {{"video_device_id", "Cam"}}) == "Cam");
+    CHECK(ObsCameraFeed::deviceFromSettings("dshow_input", json::object()).empty());
+    CHECK(ObsCameraFeed::sameDevice(" elgato 4k s", "Elgato 4K S") && !ObsCameraFeed::sameDevice("", ""));
+    std::vector<ObsCameraFeed::CaptureInput> inputs = {
+        {"Webcam", "dshow_input", "HD Webcam"}, {"Console", "dshow_input", "Elgato 4K S"}, {"Other", "dshow_input", "X"}};
+    CHECK(ObsCameraFeed::pickInput(inputs, "")->name == "Console");      // Elgato first
+    CHECK(ObsCameraFeed::pickInput(inputs, "Other")->name == "Other");   // explicit choice
+    CHECK(ObsCameraFeed::pickInput(inputs, "Gone")->name == "Console");  // missing choice: automatic
+    CHECK(!ObsCameraFeed::pickInput({}, ""));
+    auto c = ObsCameraFeed::Config::fromJson({{"enabled", "yes"}, {"sceneName", ""}, {"autoStartVirtualCam", true}});
+    CHECK(!c.enabled && c.sceneName == "USC TikTok Feed" && c.autoStartVirtualCam);
+}
+
 int main() {
     testTwitchParse();
     testKickParse();
@@ -768,6 +907,9 @@ int main() {
     testSettingsSanitize();
     testCaptureDecisions();
     testCaptureSafety();
+    testSpeechQueue();
+    testDisplayFirstPipeline();
+    testObsFeedHelpers();
     if (failures) {
         std::cerr << failures << " check(s) failed\n";
         return 1;

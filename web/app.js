@@ -167,6 +167,22 @@
     if (m.tts && pageSpeaks() && (forceSpeak || m.ttsTarget === 'browser')) tts.enqueue(m.tts);
   }
 
+  function applyUpdate(m) {
+    const node = [...chatEl.querySelectorAll('.msg')].find((n) => n.dataset.id === m.id);
+    if (!node) {
+      if (!seen.has(m.id)) renderMessage(m); // never shown here: show it complete
+      return;
+    }
+    if (m.translation && !node.querySelector('.translation')) {
+      const tr = el('div', 'translation', m.translation);
+      tr.dir = 'auto';
+      tr.lang = settings.translation.targetLang;
+      node.append(tr);
+      if (stickToBottom || isOverlay) chatEl.scrollTop = chatEl.scrollHeight;
+    }
+    if (m.tts && pageSpeaks() && (forceSpeak || m.ttsTarget === 'browser')) tts.enqueue(m.tts);
+  }
+
   function trimChat() {
     const max = Math.max(20, settings.ui.maxMessages | 0);
     const nodes = chatEl.querySelectorAll('.msg');
@@ -206,18 +222,50 @@
       $('#tts-skip').hidden = !show;
     }
 
+    // Same rules as the native player: consecutive segments in one language
+    // become one request, the next messages' audio is loaded while the
+    // current one plays, and messages older than tts.maxDelaySec are dropped.
+    const LOOKAHEAD = 2;
+
+    function merge(segments) {
+      const out = [];
+      for (const s of segments) {
+        const text = String((s && s.text) || '').trim();
+        const lang = (s && s.lang) || 'en';
+        if (!text) continue;
+        if (out.length && out[out.length - 1].lang === lang) out[out.length - 1].text += ' ' + text;
+        else out.push({ text, lang });
+      }
+      return out;
+    }
+
+    function preload(item) {
+      if (item.audios) return;
+      item.audios = item.segments.map((seg) => {
+        const a = new Audio('/api/tts?' + new URLSearchParams({ text: seg.text, lang: seg.lang || 'en' }));
+        a.preload = 'auto';
+        return a;
+      });
+    }
+
+    function prefetch() {
+      for (let i = 0; i < Math.min(LOOKAHEAD, queue.length); i++) preload(queue[i]);
+    }
+
     function enqueue(segments) {
       if (isMuted() || !Array.isArray(segments) || !segments.length) return;
+      const merged = merge(segments);
+      if (!merged.length) return;
       const max = Math.max(1, settings.tts.maxQueue | 0);
       while (queue.length >= max) queue.shift(); // stay close to live chat
-      queue.push(segments);
+      queue.push({ segments: merged, at: Date.now(), audios: null });
+      prefetch();
       run();
     }
 
-    function playSegment(seg) {
+    function playSegment(audio) {
       return new Promise((resolve) => {
-        const q = new URLSearchParams({ text: seg.text, lang: seg.lang || 'en' });
-        const audio = new Audio('/api/tts?' + q);
+        if (audio.error) return resolve(); // its download failed: next clip
         audio.volume = Math.min(1, Math.max(0, +settings.tts.volume));
         audio.playbackRate = Math.min(4, Math.max(0.25, +settings.tts.rate));
         audio.preservesPitch = true;
@@ -241,11 +289,15 @@
       if (playing) return;
       playing = true;
       while (queue.length) {
-        const segments = queue.shift();
+        const item = queue.shift();
+        const maxDelay = Math.max(0, +settings.tts.maxDelaySec || 0) * 1000;
+        if (maxDelay && Date.now() - item.at > maxDelay) continue; // too late to be useful
+        preload(item);
+        prefetch(); // the next message loads while this one plays
         skipRequested = false;
-        for (const seg of segments) {
+        for (const audio of item.audios) {
           if (isMuted() || skipRequested) break;
-          await playSegment(seg);
+          await playSegment(audio);
         }
       }
       playing = false;
@@ -619,6 +671,8 @@
       renderStatus();
     });
     es.addEventListener('chat', (e) => renderMessage(JSON.parse(e.data)));
+    // The text was shown right away; its translation line / speech follow here.
+    es.addEventListener('chat-update', (e) => applyUpdate(JSON.parse(e.data)));
     es.addEventListener('status', (e) => {
       const s = JSON.parse(e.data);
       status.platforms[s.platform] = Object.assign(status.platforms[s.platform] || {}, { state: s.state, detail: s.detail });

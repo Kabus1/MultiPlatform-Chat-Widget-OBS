@@ -9,6 +9,8 @@
 #include <algorithm>
 #include <chrono>
 
+#include "core/Util.hpp"
+
 namespace usc {
 
 using nlohmann::json;
@@ -24,6 +26,10 @@ struct AudioPlayer::Engine {
 AudioPlayer::AudioPlayer(Settings& settings, TtsService& tts) : settings_(settings), tts_(tts) {}
 
 namespace {
+
+constexpr size_t kFetchers = 2;   // parallel Google TTS downloads
+constexpr size_t kLookahead = 3;  // messages fetched ahead (incl. the one playing)
+constexpr int64_t kFillTimeoutMs = 6000; // a slot whose lookup never finishes stops blocking after this
 
 // Stable, backend-specific id string for a device ("" if the backend has none).
 std::string deviceKey(ma_backend backend, const ma_device_id& id) {
@@ -54,6 +60,7 @@ void AudioPlayer::start() {
         applySavedDevice(true);
         run();
     });
+    for (size_t i = 0; i < kFetchers; ++i) fetchers_.emplace_back([this] { fetchLoop(); });
 }
 
 void AudioPlayer::reapplyDevice() {
@@ -79,24 +86,95 @@ void AudioPlayer::stop() {
     skip_ = true;
     cv_.notify_all();
     if (worker_.joinable()) worker_.join();
+    for (auto& t : fetchers_)
+        if (t.joinable()) t.join();
+    fetchers_.clear();
     std::lock_guard<std::mutex> lock(engineMutex_);
     releaseEngine();
     if (engine_ && engine_->contextReady) ma_context_uninit(&engine_->context);
     engine_.reset();
 }
 
-void AudioPlayer::enqueue(const json& segments) {
-    if (!segments.is_array() || segments.empty()) return;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        size_t max = static_cast<size_t>(std::max<int64_t>(1, settings_.snapshot()["tts"].value("maxQueue", 10)));
-        while (queue_.size() >= max) queue_.pop_front(); // stay close to live chat
-        queue_.push_back(segments);
+json AudioPlayer::mergeSegments(const json& segments) {
+    json out = json::array();
+    if (!segments.is_array()) return out;
+    for (const auto& seg : segments) {
+        if (!seg.is_object()) continue;
+        std::string text = util::trim(seg.value("text", std::string()));
+        std::string lang = seg.value("lang", std::string("en"));
+        if (text.empty()) continue;
+        if (!out.empty() && out.back()["lang"] == lang)
+            out.back()["text"] = out.back()["text"].get<std::string>() + " " + text;
+        else
+            out.push_back({{"text", text}, {"lang", lang}});
     }
-    cv_.notify_one();
+    return out;
 }
 
-void AudioPlayer::skip() { skip_ = true; }
+// Caller holds mutex_.
+void AudioPlayer::pushItemLocked(std::shared_ptr<Item> item, const json& tts) {
+    size_t max = static_cast<size_t>(std::max<int64_t>(1, tts.value("maxQueue", 10)));
+    while (queue_.size() >= max) { // stay close to live chat: drop the oldest
+        queue_.pop_front();
+        ++droppedOverflow_;
+    }
+    queue_.push_back(std::move(item));
+}
+
+void AudioPlayer::enqueue(const json& segments) {
+    json merged = mergeSegments(segments);
+    if (merged.empty()) return;
+    json tts = settings_.snapshot()["tts"];
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto item = std::make_shared<Item>();
+        item->ticket = ++nextTicket_;
+        item->createdMs = util::nowMs();
+        item->filled = true;
+        for (const auto& seg : merged) item->clips.push_back({seg["text"], seg["lang"], 0, {}});
+        pushItemLocked(std::move(item), tts);
+    }
+    cv_.notify_all();
+}
+
+uint64_t AudioPlayer::reserve(int64_t createdMs) {
+    json tts = settings_.snapshot()["tts"];
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto item = std::make_shared<Item>();
+    item->ticket = ++nextTicket_;
+    item->createdMs = createdMs > 0 ? createdMs : util::nowMs();
+    uint64_t t = item->ticket;
+    pushItemLocked(std::move(item), tts);
+    return t;
+}
+
+void AudioPlayer::fill(uint64_t ticket, const json& segments) {
+    json merged = mergeSegments(segments);
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = std::find_if(queue_.begin(), queue_.end(), [&](const auto& i) { return i->ticket == ticket; });
+        if (it == queue_.end()) return; // already dropped (overflow / clear / stale)
+        if (merged.empty()) {
+            queue_.erase(it); // nothing to say: free the slot
+        } else {
+            for (const auto& seg : merged) (*it)->clips.push_back({seg["text"], seg["lang"], 0, {}});
+            (*it)->filled = true;
+        }
+    }
+    cv_.notify_all();
+}
+
+json AudioPlayer::stats() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return {{"queued", queue_.size()},       {"spoken", spoken_},
+            {"droppedStale", droppedStale_}, {"droppedOverflow", droppedOverflow_},
+            {"fetchFailed", fetchFailed_},   {"lastLagMs", lastLagMs_}};
+}
+
+void AudioPlayer::skip() {
+    skip_ = true;
+    cv_.notify_all(); // also wakes a player that waits for a clip download
+}
 
 void AudioPlayer::clear() {
     {
@@ -104,6 +182,7 @@ void AudioPlayer::clear() {
         queue_.clear();
     }
     skip_ = true;
+    cv_.notify_all();
 }
 
 void AudioPlayer::releaseEngine() {
@@ -219,10 +298,9 @@ json AudioPlayer::devices() {
     return out;
 }
 
-bool AudioPlayer::playSegment(const std::string& text, const std::string& lang, const json& s) {
-    const json& g = s["google"];
-    auto mp3 = tts_.synthesize(text, lang, g.value("apiKey", ""), g.value("cloudVoice", ""));
-    if (!mp3 || skip_) return false;
+bool AudioPlayer::playAudio(const std::string& mp3Bytes, const json& s) {
+    const std::string* mp3 = &mp3Bytes;
+    if (mp3->empty() || skip_) return false;
 
     std::lock_guard<std::mutex> lock(engineMutex_);
     std::string error;
@@ -264,9 +342,60 @@ bool AudioPlayer::playSegment(const std::string& text, const std::string& lang, 
     return true;
 }
 
+// Background downloads: takes the first clip that is not fetched yet among
+// the next kLookahead messages (the one playing first), so the next message's
+// audio is ready by the time the current one ends.
+void AudioPlayer::fetchLoop() {
+    while (running_) {
+        std::shared_ptr<Item> item;
+        size_t index = 0;
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            auto findWork = [&] {
+                std::vector<std::shared_ptr<Item>> window;
+                if (current_) window.push_back(current_);
+                for (size_t i = 0; i < queue_.size() && window.size() < kLookahead; ++i) window.push_back(queue_[i]);
+                for (auto& it : window) {
+                    if (!it->filled) continue;
+                    for (size_t c = 0; c < it->clips.size(); ++c)
+                        if (it->clips[c].state == 0) {
+                            item = it;
+                            index = c;
+                            return true;
+                        }
+                }
+                return false;
+            };
+            cv_.wait(lock, [&] { return !running_ || findWork(); });
+            if (!running_) return;
+            item->clips[index].state = 1;
+        }
+        std::string text = item->clips[index].text, lang = item->clips[index].lang;
+        json g = settings_.snapshot()["google"];
+        std::optional<std::string> mp3;
+        try {
+            mp3 = synth_ ? synth_(text, lang)
+                         : tts_.synthesize(text, lang, g.value("apiKey", ""), g.value("cloudVoice", ""));
+        } catch (...) {
+        }
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            Clip& c = item->clips[index];
+            if (mp3 && !mp3->empty()) {
+                c.mp3 = std::move(*mp3);
+                c.state = 2;
+            } else {
+                c.state = 3;
+                ++fetchFailed_;
+            }
+        }
+        cv_.notify_all();
+    }
+}
+
 void AudioPlayer::run() {
     while (running_) {
-        json segments;
+        std::shared_ptr<Item> item;
         {
             std::unique_lock<std::mutex> lock(mutex_);
             if (queue_.empty()) {
@@ -288,17 +417,59 @@ void AudioPlayer::run() {
                     continue;
                 }
                 if (!running_) return;
+                continue;
             }
-            segments = std::move(queue_.front());
+            json tts = settings_.snapshot()["tts"];
+            const int64_t maxDelayMs = std::max<int64_t>(0, tts.value("maxDelaySec", 20)) * 1000;
+            auto head = queue_.front();
+            const int64_t now = util::nowMs();
+            // Too old: reading it now would only put the voice further behind chat.
+            if (maxDelayMs > 0 && now - head->createdMs > maxDelayMs) {
+                queue_.pop_front();
+                ++droppedStale_;
+                continue;
+            }
+            if (!head->filled) {
+                // Its translation / language lookup is still running: keep the
+                // order, but never wait past its deadline.
+                int64_t deadline = head->createdMs + kFillTimeoutMs;
+                if (maxDelayMs > 0) deadline = std::min(deadline, head->createdMs + maxDelayMs);
+                cv_.wait_for(lock, std::chrono::milliseconds(std::max<int64_t>(1, deadline - now)), [&] {
+                    return !running_ || queue_.empty() || queue_.front() != head || head->filled || reopen_.load();
+                });
+                if (!head->filled && !queue_.empty() && queue_.front() == head && util::nowMs() >= deadline) {
+                    queue_.pop_front();
+                    ++droppedStale_;
+                }
+                continue;
+            }
             queue_.pop_front();
+            current_ = head;
+            item = head;
             skip_ = false;
+            lastLagMs_ = now - head->createdMs;
         }
-        for (const auto& seg : segments) {
-            if (!running_ || skip_) break;
+        cv_.notify_all(); // fetchers: the lookahead window moved
+        for (size_t i = 0; i < item->clips.size(); ++i) {
+            std::string mp3;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                // Normally ready already (prefetched); bounded by the HTTP timeout.
+                cv_.wait(lock, [&] { return !running_ || skip_ || item->clips[i].state >= 2; });
+                if (!running_ || skip_) break;
+                if (item->clips[i].state != 2) continue; // download failed: next clip
+                mp3 = std::move(item->clips[i].mp3);
+            }
             json s = settings_.snapshot();
             if (s["audio"].value("muted", false)) break;
-            playSegment(seg.value("text", ""), seg.value("lang", "en"), s);
+            playAudio(mp3, s);
         }
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            current_.reset();
+            ++spoken_;
+        }
+        cv_.notify_all();
     }
 }
 

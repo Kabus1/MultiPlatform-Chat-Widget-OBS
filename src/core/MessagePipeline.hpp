@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/ChatMessage.hpp"
+#include "core/WorkerPool.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -19,7 +20,16 @@ class Translator;
 class EmoteRegistry;
 
 // Enriches every incoming chat message (language detection, translation line,
-// TTS segments) on a worker thread, then publishes it to the dock.
+// TTS segments) and publishes it to the dock.
+//
+// Latency rules:
+//  - the message text is published at once; network lookups (translation /
+//    language detection) never delay it - their result follows as a
+//    "chat-update" event;
+//  - lookups run on a small pool, so one slow Google request never holds up
+//    the messages behind it;
+//  - native speech keeps chat order through reserved slots in the speech
+//    queue (reserve on arrival, fill when the lookup is done).
 class MessagePipeline {
 public:
     MessagePipeline(Settings& settings, EventHub& hub, Translator& translator, EmoteRegistry* emotes = nullptr);
@@ -29,8 +39,12 @@ public:
     void stop();
     void submit(ChatMessage m);
 
-    // Receives TTS segments when audio.output == "app" (native playback).
-    void setSpeechSink(std::function<void(const nlohmann::json&)> sink) { speechSink_ = std::move(sink); }
+    // Native playback (audio.output == "app"): ordered slots in the speech queue.
+    struct SpeechHooks {
+        std::function<uint64_t(int64_t createdMs)> reserve;
+        std::function<void(uint64_t ticket, const nlohmann::json& segments)> fill; // null = nothing to say
+    };
+    void setSpeechHooks(SpeechHooks hooks) { speech_ = std::move(hooks); }
     uint64_t botsFiltered() const { return botsFiltered_; }
 
     // Pure decision logic, separated so it can be unit-tested without network.
@@ -49,7 +63,8 @@ public:
 
 private:
     void run();
-    void process(ChatMessage& m, size_t backlog);
+    // Translation / detection (when allowed), decision, speech slot, publish.
+    void complete(ChatMessage& m, const nlohmann::json& s, uint64_t ticket, bool alreadyPublished, bool lookup);
 
     Settings& settings_;
     EventHub& hub_;
@@ -61,7 +76,8 @@ private:
     std::condition_variable cv_;
     std::deque<ChatMessage> queue_;
     uint64_t seq_ = 0;
-    std::function<void(const nlohmann::json&)> speechSink_;
+    SpeechHooks speech_;
+    WorkerPool lookups_{3};
     std::atomic<uint64_t> botsFiltered_{0};
 };
 

@@ -55,6 +55,15 @@ json Settings::defaults() {
             {"port", 4455},
             {"password", ""},
         }},
+        {"camFeed", {
+            // TikTok Studio camera through OBS Virtual Camera: OBS keeps the
+            // capture card as a direct Video Capture Device source, TikTok
+            // Studio selects "OBS Virtual Camera". Nothing opens the card twice.
+            {"enabled", false},                // keep the feed scene in OBS (set by "Set up")
+            {"sceneName", "USC TikTok Feed"},
+            {"sourceName", ""},                // "" = the OBS capture source is picked automatically
+            {"autoStartVirtualCam", false},    // start OBS Virtual Camera whenever OBS connects
+        }},
         {"capture", {
             // Video capture relay (Windows): one device -> a window OBS Game
             // Capture / TikTok Studio can capture without fighting over the device.
@@ -112,6 +121,9 @@ json Settings::defaults() {
             {"volume", 1.0},
             {"rate", 1.0},
             {"maxQueue", 10},
+            // Speech that would start later than this after the message arrived
+            // is skipped, so the voice stays close to live chat (0 = never skip).
+            {"maxDelaySec", 20},
             {"platforms", {{"twitch", true}, {"youtube", true}, {"kick", true}, {"tiktok", true}}},
             {"ignoredUsers", json::array()}, // real users who should not be read aloud
         }},

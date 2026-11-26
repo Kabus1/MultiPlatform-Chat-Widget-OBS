@@ -38,6 +38,13 @@ It also translates messages with Google Translate and reads them aloud with Goog
     - Short slang is translated as English even when Google's detection guesses another language.
   - If Google's free endpoint rate-limits (HTTP 429), translation pauses for 60 s instead of retrying non-stop. A Google Cloud API key avoids the limit.
 - **Video capture relay (Windows).** One capture device (Elgato etc.) is shown in a window that OBS *Game Capture* and TikTok Studio can both capture, so the device is opened only once. It has its own page (🎥 button, or `/capture`). See [Video capture relay](#video-capture-relay-windows).
+- **Fast speech that stays live.**
+  - A chat line appears immediately. Its translation line follows when Google answers (`chat-update` event).
+  - Translations run on a small pool, so one slow request never holds up the next messages.
+  - Speech keeps chat order. Each message reserves its place on arrival.
+  - The next messages' audio is downloaded while the current one plays, and "name: message" is one request instead of two clips.
+  - Messages that would start later than *Skip messages older than* (default 20 s) are skipped instead of read late.
+  - Network timeouts are 5 s, and connections are reused.
 - **Google TTS** with separate toggles for:
   - reading the username
   - reading the message text
@@ -231,7 +238,29 @@ The app connects to OBS's own WebSocket server (OBS 28+, *Tools → WebSocket Se
 - **It reacts to "stream started".** When OBS starts streaming (`StreamStateChanged`), YouTube and TikTok check right away and keep checking every 15 s for 3 minutes until the stream shows as live. Nothing needs to poll often while you are offline.
 - **It stays quiet when OBS is closed.** It retries every 30 s at most and only reports when its status changes.
 
+### TikTok Studio feed via OBS (recommended for a capture card)
+A capture card (Elgato etc.) can be opened by only one program at a time. That program locks the others out, whichever starts first. The clean setup has **one owner, OBS**:
+
+- OBS keeps the card as a direct **Video Capture Device** source, so recording and preview are untouched. There is no Game Capture of another window, which was the cause of the stutter.
+- TikTok Studio selects **OBS Virtual Camera** as its camera. The virtual camera gets frames from inside OBS, so the card is never opened a second time, in any start order.
+
+The 🎥 page (*TikTok Studio feed via OBS*) drives this over OBS's WebSocket server:
+
+1. **Set up feed scene** adds the scene `USC TikTok Feed` to OBS.
+   - The scene *references* your existing capture source, so OBS still has one handle on the device.
+   - The source is fitted to the canvas.
+   - It picks the source automatically (the one using an Elgato device, else the first Video Capture Device), or the one you choose.
+2. In OBS, once (OBS 30+): *Controls › ⚙ next to Start Virtual Camera › Output Type: Scene › USC TikTok Feed*. With *Program*, TikTok Studio gets your whole OBS output instead.
+3. **Start Virtual Camera**, or tick *Start it automatically when OBS connects*. In TikTok Studio, add a camera source and pick **OBS Virtual Camera**.
+
+The app also protects the setup:
+- The capture relay below never opens a device that OBS uses.
+- If OBS starts using it while the relay runs, the relay releases it at once.
+
 ### Video capture relay (Windows)
+
+*Advanced: the relay opens the device itself and shows it in a window. Use it only for a card OBS does not use; for an Elgato that OBS records, use the TikTok feed above.*
+
 A capture card can be opened by only one program at a time. When OBS has a *Video Capture Device* source and TikTok Studio wants the same card, one of them fails. The relay opens the card **once** and shows it in a normal window, **USC Capture Output**. Any number of programs can then capture that window.
 
 **Setup:**
@@ -319,7 +348,7 @@ tests/unit_tests.cpp      parser + TTS/translation decision tests (no network)
 | GET | `/api/settings` | current settings |
 | POST | `/api/settings` | JSON merge-patch (needs header `X-USC: 1`) |
 | GET | `/api/status` | per-platform connection state |
-| GET | `/api/events` | SSE stream: `hello`, `chat`, `status`, `settings`, `clear`, `speak`, `capture` |
+| GET | `/api/events` | SSE stream: `hello`, `chat`, `chat-update`, `status`, `settings`, `clear`, `speak`, `capture`, `camfeed` |
 | GET | `/api/tts?text=&lang=` | MP3 audio |
 | POST | `/api/auth/{twitch,youtube}/login` / `logout` | OAuth |
 | GET | `/api/audio/devices` | output devices + saved choice |
@@ -327,6 +356,8 @@ tests/unit_tests.cpp      parser + TTS/translation decision tests (no network)
 | GET | `/api/links` | dock / overlay URLs |
 | POST | `/api/open?target=dock\|overlay\|overlayVoice` | open one of those links in the browser |
 | POST | `/api/test`, `/api/clear`, `/api/reconnect?platform=` | tools |
+| GET | `/api/camfeed/status` | TikTok feed: OBS capture sources, feed scene, Virtual Camera state |
+| POST | `/api/camfeed/setup`, `/api/camfeed/virtualcam?on=1\|0` | create/repair the feed scene; start/stop OBS Virtual Camera |
 | GET | `/api/capture/status` | relay state, chosen mode, measured FPS, window state (SSE event `capture`) |
 | GET | `/api/capture/devices` · POST `/api/capture/devices/refresh` | capture devices |
 | GET | `/api/capture/modes?device=` | the device's own modes (`probing: true` while being read) |

@@ -6,6 +6,7 @@
 #include "core/MessagePipeline.hpp"
 #include "core/Settings.hpp"
 #include "core/TokenStore.hpp"
+#include "integrations/ObsCameraFeed.hpp"
 #include "integrations/ObsWatcher.hpp"
 #include "net/OAuth.hpp"
 #include "platforms/PlatformClient.hpp"
@@ -63,6 +64,8 @@ public:
 
     // Video capture relay (Elgato etc. -> Game-Capturable window).
     capture::CaptureRelay& capture() { return *capture_; }
+    // TikTok Studio feed via OBS Virtual Camera (OBS stays the device's only owner).
+    ObsCameraFeed& camFeed() { return *camFeed_; }
 
 private:
     std::optional<TokenSet> validToken(const std::string& platform, bool forceRefresh);
@@ -105,8 +108,10 @@ private:
     void restartObs();
     void onObsStreamState(bool streaming);
     std::mutex obsMutex_;
-    std::unique_ptr<ObsWatcher> obs_;
+    std::shared_ptr<ObsWatcher> obs_; // shared with camFeed_ (its requests)
     nlohmann::json obsConfig_;
+    std::unique_ptr<ObsCameraFeed> camFeed_; // created before capture_ (its conflict check)
+    nlohmann::json camFeedConfig_;
 
     std::unique_ptr<capture::CaptureRelay> capture_;
     nlohmann::json captureConfig_;

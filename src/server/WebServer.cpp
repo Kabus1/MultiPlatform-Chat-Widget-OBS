@@ -265,6 +265,20 @@ void WebServer::routes() {
         sendJson(res, {{"ok", true}});
     });
 
+    // --- TikTok feed via OBS Virtual Camera (calls return at once) ----------
+    s.Get("/api/camfeed/status", [this](const httplib::Request&, httplib::Response& res) {
+        sendJson(res, app_.camFeed().status());
+    });
+    s.Post("/api/camfeed/setup", [this](const httplib::Request&, httplib::Response& res) {
+        app_.applySettings({{"camFeed", {{"enabled", true}}}});
+        app_.camFeed().setupNow();
+        sendJson(res, {{"ok", true}});
+    });
+    s.Post("/api/camfeed/virtualcam", [this](const httplib::Request& req, httplib::Response& res) {
+        app_.camFeed().setVirtualCam(req.get_param_value("on") != "0");
+        sendJson(res, {{"ok", true}});
+    });
+
     // --- video capture relay (all calls return at once; work is queued) ------
     s.Get("/api/capture/status", [this](const httplib::Request&, httplib::Response& res) {
         sendJson(res, app_.capture().status());

@@ -34,7 +34,8 @@ App::App(const std::string& configDir, int portOverride)
       hub_(100),
       pipeline_(settings_, hub_, translator_, &emotes_),
       audio_(settings_, tts_) {
-    pipeline_.setSpeechSink([this](const json& segments) { audio_.enqueue(segments); });
+    pipeline_.setSpeechHooks({[this](int64_t createdMs) { return audio_.reserve(createdMs); },
+                              [this](uint64_t ticket, const json& segments) { audio_.fill(ticket, segments); }});
     settings_.load();
     tokens_.load();
     port_ = portOverride > 0 ? portOverride : settings_.snapshot()["server"].value("port", 8787);
@@ -59,10 +60,14 @@ App::App(const std::string& configDir, int portOverride)
         captureAutoStart_ = autoStart && wasEnabled && !crashedLastRun;
         if (wasEnabled) settings_.applyPatch({{"capture", {{"enabled", false}}}});
     }
+    camFeed_ = std::make_unique<ObsCameraFeed>([this](const json& st) { hub_.publish("camfeed", st); });
     capture_ = std::make_unique<capture::CaptureRelay>(
         [this](const json& st) { hub_.publish("capture", st); },
         // Window closed by the user / fatal error: remember it, so it stays off.
         [this] { applySettings({{"capture", {{"enabled", false}}}}); }, marker);
+    // The relay never opens a capture card that OBS is using (that is what
+    // locks OBS out); OBS + Virtual Camera is the way to share it.
+    capture_->setConflictCheck([this](const std::string& deviceName) { return camFeed_->conflictFor(deviceName); });
     if (crashedLastRun) {
         LOG_WARN("capture", "previous run ended while the capture relay was active: not starting it automatically");
         capture_->setNotice("The app closed unexpectedly while the capture relay was running last time, so it "
@@ -77,6 +82,9 @@ void App::start() {
     pipeline_.start();
     if (settings_.snapshot()["ui"].value("thirdPartyEmotes", true)) emotes_.loadGlobalAsync();
     for (const char* p : kPlatforms) restartPlatform(p);
+    camFeed_->start();
+    camFeedConfig_ = settings_.snapshot()["camFeed"];
+    camFeed_->apply(ObsCameraFeed::Config::fromJson(camFeedConfig_));
     restartObs();
     capture_->start(); // idle (no thread wake-ups) until the relay is enabled
     if (captureAutoStart_) settings_.applyPatch({{"capture", {{"enabled", true}}}});
@@ -86,6 +94,7 @@ void App::start() {
 
 void App::restartObs() {
     std::lock_guard<std::mutex> lock(obsMutex_);
+    camFeed_->attach(nullptr);
     if (obs_) {
         obs_->stop();
         obs_.reset();
@@ -100,9 +109,12 @@ void App::restartObs() {
     oc.host = cfg.value("host", "127.0.0.1");
     oc.port = cfg.value("port", 4455);
     oc.password = cfg.value("password", "");
-    obs_ = std::make_unique<ObsWatcher>(
+    obs_ = std::make_shared<ObsWatcher>(
         oc, [this](bool streaming) { onObsStreamState(streaming); },
         [this](const std::string& st, const std::string& d) { setStatus("obs", st, d); });
+    obs_->setReadyHandler([this](bool ready) { camFeed_->onObsReady(ready); });
+    obs_->setEventHandler([this](const std::string& type, const json& data) { camFeed_->onObsEvent(type, data); });
+    camFeed_->attach(obs_);
     obs_->start();
 }
 
@@ -124,9 +136,11 @@ void App::shutdown() {
     for (auto& [name, c] : clients) c->stop();
     {
         std::lock_guard<std::mutex> lock(obsMutex_);
+        if (camFeed_) camFeed_->attach(nullptr);
         if (obs_) obs_->stop();
         obs_.reset();
     }
+    if (camFeed_) camFeed_->stop();
     if (capture_) capture_->stop(); // releases the device before the process exits
     pipeline_.stop();
     audio_.stop();
@@ -449,6 +463,10 @@ json App::applySettings(const json& patch) {
         obsChanged = obsConfig_ != s["obs"];
     }
     if (obsChanged) restartObs();
+    if (camFeedConfig_ != s["camFeed"]) {
+        camFeedConfig_ = s["camFeed"];
+        camFeed_->apply(ObsCameraFeed::Config::fromJson(camFeedConfig_)); // never blocks
+    }
     {
         std::lock_guard<std::mutex> lock(obsMutex_);
         if (captureConfig_ != s["capture"]) {

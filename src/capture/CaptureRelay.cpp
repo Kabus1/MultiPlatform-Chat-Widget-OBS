@@ -361,6 +361,25 @@ void CaptureRelay::tick() {
         std::lock_guard<std::mutex> lock(stateMutex_);
         open = sessionOpen_;
     }
+    if (open && conflict_) {
+        std::string name;
+        {
+            std::lock_guard<std::mutex> lock(stateMutex_);
+            name = activeDeviceName_;
+        }
+        std::string why = name.empty() ? std::string() : conflict_(name);
+        if (!why.empty()) {
+            // OBS wants the device: release it right away and stay off.
+            stopSession();
+            fail("Stopped so OBS can use the device. " + why, false);
+            {
+                std::lock_guard<std::mutex> lock(stateMutex_);
+                cfg_.enabled = false;
+            }
+            if (onDisabled_) onDisabled_();
+            return;
+        }
+    }
     if (open) {
         OutputState os = output_->state();
         if (os.faulted) {
@@ -445,6 +464,17 @@ void CaptureRelay::startSession() {
     if (id.empty()) return fail("\"" + (cfg.deviceName.empty() ? cfg.deviceId : cfg.deviceName) +
                                     "\" is not connected (or its driver is not installed)",
                                 true);
+    std::string deviceName;
+    {
+        std::lock_guard<std::mutex> lock(stateMutex_);
+        for (const auto& d : devices_)
+            if (d.id == id) deviceName = d.name;
+    }
+    // Never take a device OBS is using: that is what locks OBS out.
+    if (conflict_) {
+        std::string why = conflict_(deviceName);
+        if (!why.empty()) return fail(why, false);
+    }
 
     std::string error;
     std::vector<Mode> modes = modesFor(id, error);
@@ -478,6 +508,7 @@ void CaptureRelay::startSession() {
         std::lock_guard<std::mutex> lock(stateMutex_);
         sessionOpen_ = true;
         activeDeviceId_ = id;
+        activeDeviceName_ = deviceName;
         selected_ = *mode;
         delivered_ = delivered;
         outW_ = outW;
@@ -509,6 +540,7 @@ void CaptureRelay::stopSession() {
     outW_ = outH_ = 0;
     fpsCap_ = 0;
     activeDeviceId_.clear();
+    activeDeviceName_.clear();
     if (state_ != "error") {
         state_ = "off";
         if (wasOpen) detail_.clear();

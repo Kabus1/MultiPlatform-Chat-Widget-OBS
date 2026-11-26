@@ -10,6 +10,10 @@ namespace usc {
 
 using nlohmann::json;
 
+namespace {
+constexpr int kTranslateTimeoutSec = 5; // the message is shown anyway; the line is extra
+} // namespace
+
 Translation Translator::translate(const std::string& text, const std::string& targetLang, const std::string& apiKey,
                                   const std::string& sourceLang) {
     const std::string source = sourceLang.empty() ? "auto" : sourceLang;
@@ -38,7 +42,8 @@ Translation Translator::translate(const std::string& text, const std::string& ta
 Translation Translator::freeEndpoint(const std::string& text, const std::string& target, const std::string& source) {
     Translation out;
     auto r = http::get("https://translate.googleapis.com/translate_a/single?" +
-                       http::buildQuery({{"client", "gtx"}, {"sl", source}, {"tl", target}, {"dt", "t"}, {"q", text}}));
+                       http::buildQuery({{"client", "gtx"}, {"sl", source}, {"tl", target}, {"dt", "t"}, {"q", text}}),
+                       {}, kTranslateTimeoutSec);
     if (!r.ok()) {
         out.error = r.status == 0 ? r.error : "translate HTTP " + std::to_string(r.status);
         if (r.status == 429) {
@@ -68,7 +73,8 @@ Translation Translator::cloudV2(const std::string& text, const std::string& targ
     Translation out;
     json body = {{"q", text}, {"target", target}, {"format", "text"}};
     if (source != "auto") body["source"] = source;
-    auto r = http::postJson("https://translation.googleapis.com/language/translate/v2?key=" + apiKey, body.dump());
+    auto r = http::postJson("https://translation.googleapis.com/language/translate/v2?key=" + apiKey, body.dump(), {},
+                             kTranslateTimeoutSec);
     if (!r.ok()) {
         out.error = r.status == 0 ? r.error : "Cloud Translation HTTP " + std::to_string(r.status) + ": " + r.body.substr(0, 200);
         return out;

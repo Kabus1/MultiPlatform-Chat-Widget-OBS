@@ -37,6 +37,10 @@ public:
     static bool consumeCrashMarker(const std::string& markerPath);
     // Message shown in the relay's status until the next Start.
     void setNotice(const std::string& text);
+    // Returns a message when another program (OBS) uses the device with this
+    // friendly name. The relay then never opens it - and steps aside if OBS
+    // starts using it while the relay runs. Set before start().
+    void setConflictCheck(std::function<std::string(const std::string& deviceName)> fn) { conflict_ = std::move(fn); }
     ~CaptureRelay();
 
     void start();
@@ -77,6 +81,8 @@ private:
     std::function<void(const nlohmann::json&)> onStatus_;
     std::function<void()> onDisabled_;
     std::string markerPath_;
+    std::function<std::string(const std::string&)> conflict_;
+    std::string activeDeviceName_; // (stateMutex_)
     bool markerOn_ = false;     // worker thread only
     bool faulted_ = false;      // a crash was prevented: no new sessions until restart
     std::unique_ptr<VideoBackend> backend_;

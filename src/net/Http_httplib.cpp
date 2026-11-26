@@ -6,6 +6,7 @@
 
 #include <cstdlib>
 #include <memory>
+#include <unordered_map>
 
 namespace usc::http {
 
@@ -85,6 +86,32 @@ Response convert(const httplib::Result& r) {
     return out;
 }
 
+// Keep-alive connections, one set per thread (httplib::Client is not safe
+// for concurrent use). Repeated calls to the same host - e.g. Google TTS and
+// Translate from the speech fetchers - skip the TCP + TLS handshake.
+template <class Fn>
+httplib::Result withClient(const std::string& origin, int timeoutSec, bool followRedirects, bool retryStale, Fn&& fn) {
+    thread_local std::unordered_map<std::string, std::unique_ptr<httplib::Client>> pool;
+    const std::string key = origin + '|' + std::to_string(timeoutSec) + '|' + (followRedirects ? "1" : "0");
+    auto it = pool.find(key);
+    const bool reused = it != pool.end();
+    if (!reused) {
+        if (pool.size() > 16) pool.clear();
+        auto cli = makeClient(origin, timeoutSec, followRedirects);
+        cli->set_keep_alive(true);
+        it = pool.emplace(key, std::move(cli)).first;
+    }
+    httplib::Result r = fn(*it->second);
+    if (!r) {
+        pool.erase(it);
+        // The server may have closed an idle kept-alive connection: one fresh
+        // try, for idempotent requests (GET) only - a POST is never sent twice.
+        if (retryStale && reused && r.error() != httplib::Error::ConnectionTimeout && r.error() != httplib::Error::Read)
+            return withClient(origin, timeoutSec, followRedirects, false, std::forward<Fn>(fn));
+    }
+    return r;
+}
+
 } // namespace
 
 const char* browserUserAgent() {
@@ -103,20 +130,22 @@ std::string buildQuery(const Params& params) {
 
 Response get(const std::string& url, const Headers& headers, int timeoutSec, bool followRedirects) {
     auto parts = splitUrl(url);
-    auto cli = makeClient(parts.origin, timeoutSec, followRedirects);
-    return convert(cli->Get(parts.path, toHeaders(headers)));
+    return convert(withClient(parts.origin, timeoutSec, followRedirects, true,
+                              [&](httplib::Client& c) { return c.Get(parts.path, toHeaders(headers)); }));
 }
 
 Response postForm(const std::string& url, const Params& form, const Headers& headers, int timeoutSec) {
     auto parts = splitUrl(url);
-    auto cli = makeClient(parts.origin, timeoutSec);
-    return convert(cli->Post(parts.path, toHeaders(headers), buildQuery(form), "application/x-www-form-urlencoded"));
+    return convert(withClient(parts.origin, timeoutSec, true, false, [&](httplib::Client& c) {
+        return c.Post(parts.path, toHeaders(headers), buildQuery(form), "application/x-www-form-urlencoded");
+    }));
 }
 
 Response postJson(const std::string& url, const std::string& json, const Headers& headers, int timeoutSec) {
     auto parts = splitUrl(url);
-    auto cli = makeClient(parts.origin, timeoutSec);
-    return convert(cli->Post(parts.path, toHeaders(headers), json, "application/json"));
+    return convert(withClient(parts.origin, timeoutSec, true, false, [&](httplib::Client& c) {
+        return c.Post(parts.path, toHeaders(headers), json, "application/json");
+    }));
 }
 
 } // namespace usc::http

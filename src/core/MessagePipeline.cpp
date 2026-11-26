@@ -55,8 +55,15 @@ MessagePipeline::MessagePipeline(Settings& settings, EventHub& hub, Translator& 
 
 MessagePipeline::~MessagePipeline() { stop(); }
 
+namespace {
+// More lookups waiting than this: new messages skip translation so the chat
+// (and the voice) never fall behind Google's response time.
+constexpr size_t kMaxPendingLookups = 24;
+} // namespace
+
 void MessagePipeline::start() {
     if (running_.exchange(true)) return;
+    lookups_.start();
     worker_ = std::thread([this] { run(); });
 }
 
@@ -64,6 +71,7 @@ void MessagePipeline::stop() {
     if (!running_.exchange(false)) return;
     cv_.notify_all();
     if (worker_.joinable()) worker_.join();
+    lookups_.stop();
 }
 
 void MessagePipeline::submit(ChatMessage m) {
@@ -88,19 +96,47 @@ void MessagePipeline::run() {
             queue_.pop_front();
             backlog = queue_.size();
         }
-        json s = settings_.snapshot();
-        std::string why = BotFilter::reason(m, s["bots"]);
-        if (!why.empty()) {
-            ++botsFiltered_;
-            LOG_INFO("bots", "dropped ", m.platform, " message from ", m.displayName, " (", why, ")");
-            continue; // never shown, translated or spoken
+        try {
+            json s = settings_.snapshot();
+            std::string why = BotFilter::reason(m, s["bots"]);
+            if (!why.empty()) {
+                ++botsFiltered_;
+                LOG_INFO("bots", "dropped ", m.platform, " message from ", m.displayName, " (", why, ")");
+                continue; // never shown, translated or spoken
+            }
+            if (emotes_ && s["ui"].value("thirdPartyEmotes", true)) {
+                emotes_->ensureChannelAsync(m.platform, m.channelId);
+                markThirdPartyEmotes(m, *emotes_);
+            }
+            const json& audio = s["audio"];
+            m.ttsTarget = audio.value("output", std::string("app"));
+            // Keep this message's place in the speech queue right now, before
+            // any network call (the slot is freed if it ends up silent).
+            uint64_t ticket = 0;
+            if (m.ttsTarget == "app" && !audio.value("muted", false) && speech_.reserve && ttsActiveFor(m, s["tts"]))
+                ticket = speech_.reserve(m.timestamp);
+
+            const std::string text = m.speakableText();
+            const bool arabic = s["translation"].value("preserveArabic", true) && lang::isArabicText(text);
+            const bool needLookup = !arabic && !text.empty() && wantsLookup(m, s);
+            const bool overloaded = backlog >= 40 || lookups_.pending() >= kMaxPendingLookups;
+            if (needLookup && !overloaded) {
+                hub_.publish("chat", m.toJson(), true); // the text appears now
+                auto job = [this, m, s, ticket]() mutable {
+                    try {
+                        complete(m, s, ticket, true, true);
+                    } catch (const std::exception& e) {
+                        LOG_WARN("pipeline", "lookup failed: ", e.what());
+                        if (ticket && speech_.fill) speech_.fill(ticket, nullptr);
+                    }
+                };
+                if (!lookups_.post(std::move(job)) && ticket && speech_.fill) speech_.fill(ticket, nullptr);
+            } else {
+                complete(m, s, ticket, false, false);
+            }
+        } catch (const std::exception& e) {
+            LOG_WARN("pipeline", "message dropped: ", e.what());
         }
-        process(m, backlog);
-        const json& audio = s["audio"];
-        m.ttsTarget = audio.value("output", std::string("app"));
-        if (!m.tts.is_null() && m.ttsTarget == "app" && !audio.value("muted", false) && speechSink_)
-            speechSink_(m.tts);
-        hub_.publish("chat", m.toJson(), true);
     }
 }
 
@@ -237,12 +273,8 @@ MessagePipeline::Decision MessagePipeline::decide(const ChatMessage& m, const js
     return d;
 }
 
-void MessagePipeline::process(ChatMessage& m, size_t backlog) {
-    json s = settings_.snapshot();
-    if (emotes_ && s["ui"].value("thirdPartyEmotes", true)) {
-        emotes_->ensureChannelAsync(m.platform, m.channelId);
-        markThirdPartyEmotes(m, *emotes_);
-    }
+void MessagePipeline::complete(ChatMessage& m, const json& s, uint64_t ticket, bool alreadyPublished,
+                               bool lookup) {
     std::string text = m.speakableText();
     const json& tr = s["translation"];
     const std::string target = tr.value("targetLang", std::string("ar"));
@@ -260,8 +292,7 @@ void MessagePipeline::process(ChatMessage& m, size_t backlog) {
 
     bool translated = false;
     Translation t;
-    // Under heavy load, skip lookups so the chat never lags behind.
-    if (!arabic && !text.empty() && wantsLookup(m, s) && backlog < 40) {
+    if (lookup && !arabic && !text.empty()) {
         const bool forceEnglish = slang.replaced > 0 && slang.englishLike;
         t = translator_.translate(slang.text, target, apiKey, forceEnglish ? "en" : "auto");
         // Short slang is often mis-detected (e.g. as Indonesian); retry as English.
@@ -280,6 +311,14 @@ void MessagePipeline::process(ChatMessage& m, size_t backlog) {
                         slang.replaced > 0 ? slang.text : std::string());
     m.showTranslation = d.showTranslation;
     m.tts = d.tts;
+
+    // Native speech: fill the slot reserved on arrival (null frees it).
+    if (ticket && speech_.fill) speech_.fill(ticket, m.tts);
+    json out = m.toJson();
+    if (alreadyPublished)
+        hub_.updateChat(out);
+    else
+        hub_.publish("chat", out, true);
 }
 
 } // namespace usc

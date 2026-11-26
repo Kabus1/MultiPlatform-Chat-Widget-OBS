@@ -12,6 +12,12 @@ namespace usc {
 
 using nlohmann::json;
 
+namespace {
+// A clip that takes longer than this is skipped: waiting longer would only
+// put the voice further behind the chat (the next clips are already queued).
+constexpr int kTtsTimeoutSec = 5;
+} // namespace
+
 std::optional<std::string> TtsService::synthesize(const std::string& text, const std::string& lang,
                                                   const std::string& apiKey, const std::string& voice) {
     if (text.empty()) return std::nullopt;
@@ -48,7 +54,7 @@ std::optional<std::string> TtsService::freeEndpoint(const std::string& text, con
                                              {"q", chunks[i]}, {"total", std::to_string(chunks.size())},
                                              {"idx", std::to_string(i)},
                                              {"textlen", std::to_string(util::utf8Length(chunks[i]))}}),
-                           {{"Referer", "https://translate.google.com/"}});
+                           {{"Referer", "https://translate.google.com/"}}, kTtsTimeoutSec);
         if (!r.ok()) {
             LOG_WARN("tts", "Google TTS failed (", lang, "): ", r.status == 0 ? r.error : "HTTP " + std::to_string(r.status));
             return std::nullopt;
@@ -77,7 +83,7 @@ std::optional<std::string> TtsService::cloud(const std::string& text, const std:
     // A configured voice only applies when it matches the language being spoken.
     if (!voice.empty() && voice.rfind(locale, 0) == 0) v["name"] = voice;
     json body = {{"input", {{"text", text}}}, {"voice", v}, {"audioConfig", {{"audioEncoding", "MP3"}}}};
-    auto r = http::postJson("https://texttospeech.googleapis.com/v1/text:synthesize?key=" + apiKey, body.dump(), {}, 15);
+    auto r = http::postJson("https://texttospeech.googleapis.com/v1/text:synthesize?key=" + apiKey, body.dump(), {}, kTtsTimeoutSec + 2);
     if (!r.ok()) {
         LOG_WARN("tts", "Cloud TTS failed: ", r.status == 0 ? r.error : r.body.substr(0, 200));
         return std::nullopt;

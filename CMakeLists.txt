@@ -189,6 +189,7 @@ add_library(usc_core STATIC
   src/platforms/KickClient.cpp
   src/platforms/TikTokClient.cpp
   src/integrations/ObsWatcher.cpp
+  src/integrations/ObsCameraFeed.cpp
   src/capture/CaptureTypes.cpp
   src/capture/CaptureRelay.cpp
   src/capture/CaptureStubs.cpp

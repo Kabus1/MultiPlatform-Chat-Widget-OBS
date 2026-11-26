@@ -12,8 +12,8 @@
   <div class="title">Video Capture Relay</div>
   <span id="state-pill" class="pill">…</span>
   <div class="spacer"></div>
-  <button id="start" class="primary">Start</button>
-  <button id="stop" class="danger" hidden>Stop</button>
+  <button id="start" class="primary" title="Direct relay window (advanced)">Start relay</button>
+  <button id="stop" class="danger" hidden>Stop relay</button>
 </header>
 
 <div class="layout">
@@ -81,6 +81,36 @@
   </aside>
 
   <main class="main">
+    <section class="card feed" aria-labelledby="feed-title">
+      <div class="feed-head">
+        <h4 id="feed-title">TikTok Studio feed via OBS <span class="tag">recommended</span></h4>
+        <span id="feed-pill" class="pill">…</span>
+      </div>
+      <p class="hint">OBS keeps your capture card as a normal <b>Video Capture Device</b> (direct, no Game Capture).
+        TikTok Studio uses <b>OBS Virtual Camera</b>. The card is opened only once, so nothing is locked, in any start order.</p>
+      <dl class="feed-grid">
+        <dt>OBS</dt><dd id="f-obs">–</dd>
+        <dt>Capture source</dt><dd><select id="f-source"></select> <span id="f-device" class="hint"></span></dd>
+        <dt>Feed scene</dt><dd id="f-scene">–</dd>
+        <dt>Virtual Camera</dt><dd id="f-vcam">–</dd>
+      </dl>
+      <div class="row-buttons">
+        <button id="f-setup" class="primary">Set up feed scene</button>
+        <button id="f-vcam-start">Start Virtual Camera</button>
+        <button id="f-vcam-stop" hidden>Stop Virtual Camera</button>
+        <label class="check"><input type="checkbox" id="f-auto"> Start it automatically when OBS connects</label>
+      </div>
+      <div id="f-error" class="banner error" hidden></div>
+      <ol class="steps">
+        <li>OBS: keep (or add) your capture card as <i>Sources › + › Video Capture Device</i>. Remove any Game Capture of this app's window.</li>
+        <li>Press <b>Set up feed scene</b>. It adds the scene <code id="f-scene-name">USC TikTok Feed</code>, which shows that same source.</li>
+        <li>OBS, once: <i>Controls › ⚙ next to Start Virtual Camera › Output Type: Scene › <span id="f-scene-name2">USC TikTok Feed</span></i> (OBS 30+). With <i>Program</i>, TikTok gets your whole OBS output instead.</li>
+        <li>Start the Virtual Camera, then in TikTok Studio add a camera source and pick <b>OBS Virtual Camera</b>.</li>
+      </ol>
+      <p class="hint">Needs OBS's WebSocket server (Tools › WebSocket Server Settings). The connection settings are in the chat Settings › Advanced › OBS.</p>
+    </section>
+
+    <h3 class="section-title">Advanced: direct relay window <small>(opens the device itself - only for a card OBS does not use)</small></h3>
     <div id="banner" class="banner" hidden></div>
 
     <div class="grid">
