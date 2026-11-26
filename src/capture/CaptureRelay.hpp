@@ -7,9 +7,11 @@
 #include "capture/CaptureTypes.hpp"
 #include "capture/OutputSink.hpp"
 #include "capture/VideoBackend.hpp"
+#include "capture/VirtualCamSink.hpp"
 
 #include <nlohmann/json.hpp>
 
+#include <atomic>
 #include <condition_variable>
 #include <deque>
 #include <functional>
@@ -70,6 +72,9 @@ private:
     void startSession();
     void stopSession();
     void fail(const std::string& msg, bool retryable);
+    // Device error: "busy" (another program owns it) / privacy stop the relay
+    // without retrying; anything else retries with back-off.
+    void failCapture(const std::string& msg);
     void enumerateNow();
     std::vector<Mode> modesFor(const std::string& deviceId, std::string& error);
     void onFrame(const FrameView& f);
@@ -83,10 +88,13 @@ private:
     std::string markerPath_;
     std::function<std::string(const std::string&)> conflict_;
     std::string activeDeviceName_; // (stateMutex_)
+    bool deviceBusy_ = false;      // last stop: another program had the device (stateMutex_)
     bool markerOn_ = false;     // worker thread only
     bool faulted_ = false;      // a crash was prevented: no new sessions until restart
     std::unique_ptr<VideoBackend> backend_;
     std::unique_ptr<OutputSink> output_;
+    std::unique_ptr<VirtualCamSink> vcam_;
+    std::atomic<bool> windowOpen_{false}, vcamOpen_{false}; // read on the capture thread
 
     // command queue
     std::mutex queueMutex_;

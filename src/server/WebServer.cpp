@@ -1,5 +1,7 @@
 #include "server/WebServer.hpp"
 
+#include "capture/VirtualCamSink.hpp"
+
 #include "core/App.hpp"
 #include "core/Log.hpp"
 #include "core/Util.hpp"
@@ -263,6 +265,29 @@ void WebServer::routes() {
     s.Post("/api/kick/forget", [this](const httplib::Request&, httplib::Response& res) {
         app_.kickForgetChatroom();
         sendJson(res, {{"ok", true}});
+    });
+
+    // --- USC Virtual Camera: registration (usc_vcam.dll next to the app) -----
+    s.Get("/api/vcam/status", [](const httplib::Request&, httplib::Response& res) {
+        sendJson(res, capture::vcamInstallState().toJson());
+    });
+    // scope=machine: regsvr32 with one administrator (UAC) prompt - visible to
+    // every program. scope=user: no administrator rights, current user only.
+    s.Post("/api/vcam/install", [](const httplib::Request& req, httplib::Response& res) {
+        std::string error;
+        bool ok = capture::vcamInstall(req.get_param_value("scope") != "user", error);
+        json st = capture::vcamInstallState().toJson();
+        st["ok"] = ok;
+        st["error"] = error;
+        sendJson(res, st, ok ? 200 : 500);
+    });
+    s.Post("/api/vcam/uninstall", [](const httplib::Request& req, httplib::Response& res) {
+        std::string error;
+        bool ok = capture::vcamUninstall(req.get_param_value("scope") != "user", error);
+        json st = capture::vcamInstallState().toJson();
+        st["ok"] = ok;
+        st["error"] = error;
+        sendJson(res, st, ok ? 200 : 500);
     });
 
     // --- TikTok feed via OBS Virtual Camera (calls return at once) ----------

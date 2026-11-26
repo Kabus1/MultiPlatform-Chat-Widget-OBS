@@ -1,0 +1,8 @@
+LIBRARY usc_vcam
+EXPORTS
+    DllGetClassObject PRIVATE
+    DllCanUnloadNow PRIVATE
+    DllRegisterServer PRIVATE
+    DllUnregisterServer PRIVATE
+    UscVcamRegisterUser
+    UscVcamUnregisterUser

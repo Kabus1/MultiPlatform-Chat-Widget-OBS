@@ -191,7 +191,9 @@ add_library(usc_core STATIC
   src/integrations/ObsWatcher.cpp
   src/integrations/ObsCameraFeed.cpp
   src/capture/CaptureTypes.cpp
+  src/vcam/VcamFrame.cpp
   src/capture/CaptureRelay.cpp
+  src/capture/VirtualCamSink.cpp
   src/capture/CaptureStubs.cpp
   src/services/Translator.cpp
   src/services/TtsService.cpp
@@ -282,12 +284,43 @@ if(WIN32)
   endif()
 endif()
 
+# --- USC Virtual Camera (Windows): a DirectShow camera other programs open --
+# Built next to the executable; registered from the app's capture page
+# (per user, or for all users through regsvr32).
+if(WIN32)
+  add_library(usc_vcam SHARED
+    src/vcam/UscVcamFilter.cpp
+    src/vcam/VcamFrame.cpp
+    src/vcam/usc_vcam.def)
+  target_include_directories(usc_vcam PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_compile_definitions(usc_vcam PRIVATE NOMINMAX UNICODE _UNICODE _WIN32_WINNT=0x0A00)
+  target_link_libraries(usc_vcam PRIVATE strmiids ole32 oleaut32 uuid advapi32 winmm)
+  set_target_properties(usc_vcam PROPERTIES PREFIX "" OUTPUT_NAME usc_vcam
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+  if(MSVC)
+    target_compile_options(usc_vcam PRIVATE /W4 /utf-8 /permissive-)
+  else()
+    target_compile_options(usc_vcam PRIVATE -Wall -Wextra)
+    # Self-contained DLL: it is loaded into other programs (OBS, browsers...).
+    target_link_options(usc_vcam PRIVATE -static -static-libgcc -static-libstdc++)
+  endif()
+  add_dependencies(unified_stream_chat usc_vcam)
+  install(TARGETS usc_vcam RUNTIME DESTINATION .)
+endif()
+
 option(USC_BUILD_TESTS "Build unit tests" ON)
 if(USC_BUILD_TESTS)
   enable_testing()
   add_executable(unit_tests tests/unit_tests.cpp)
   target_link_libraries(unit_tests PRIVATE usc_core)
   add_test(NAME unit_tests COMMAND unit_tests)
+  if(WIN32)
+    # DirectShow end-to-end test of USC Virtual Camera (registers it for the
+    # current user while it runs): build, then run usc_vcam_test.exe.
+    add_executable(usc_vcam_test tests/vcam_dshow_test.cpp)
+    target_link_libraries(usc_vcam_test PRIVATE usc_core strmiids ole32 oleaut32 uuid)
+    add_dependencies(usc_vcam_test usc_vcam)
+  endif()
 endif()
 
 install(TARGETS unified_stream_chat RUNTIME DESTINATION .)

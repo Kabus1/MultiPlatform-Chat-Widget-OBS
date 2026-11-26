@@ -9,11 +9,11 @@
 <body>
 <header class="bar">
   <a class="back" href="/">&#x2190; Chat</a>
-  <div class="title">Video Capture Relay</div>
+  <div class="title">Capture &amp; Virtual Camera</div>
   <span id="state-pill" class="pill">…</span>
   <div class="spacer"></div>
-  <button id="start" class="primary" title="Direct relay window (advanced)">Start relay</button>
-  <button id="stop" class="danger" hidden>Stop relay</button>
+  <button id="start" class="primary" title="Open the capture device and publish it">Start</button>
+  <button id="stop" class="danger" hidden>Stop</button>
 </header>
 
 <div class="layout">
@@ -39,7 +39,9 @@
     </section>
 
     <section>
-      <h3>Output <small>(what OBS / TikTok Studio captures)</small></h3>
+      <h3>Output <small>(what OBS / TikTok Studio receive)</small></h3>
+      <label class="check"><input type="checkbox" id="out-vcam"> USC Virtual Camera</label>
+      <label class="check"><input type="checkbox" id="out-window"> Output window (for Game / Window Capture)</label>
       <label>Resolution
         <select id="out-res">
           <option value="source">Match source</option>
@@ -70,7 +72,7 @@
     </section>
 
     <section>
-      <h3>Window</h3>
+      <h3>Output window <small>(only if enabled above)</small></h3>
       <label>Window title (pick this in OBS)
         <input id="title" type="text" maxlength="80">
       </label>
@@ -81,9 +83,40 @@
   </aside>
 
   <main class="main">
-    <section class="card feed" aria-labelledby="feed-title">
+    <section class="card feed" aria-labelledby="vcam-title">
       <div class="feed-head">
-        <h4 id="feed-title">TikTok Studio feed via OBS <span class="tag">recommended</span></h4>
+        <h4 id="vcam-title">USC Virtual Camera <span class="tag">recommended</span></h4>
+        <span id="vcam-pill" class="pill">…</span>
+      </div>
+      <p class="hint">This app opens your capture card <b>once</b> and publishes it as a camera named
+        <b>USC Virtual Camera</b>: uncompressed, about one frame of delay, no window and no Game Capture.
+        OBS, TikTok Studio, browsers and other camera apps can all open it <b>at the same time</b>.</p>
+      <dl class="feed-grid">
+        <dt>Installed</dt><dd id="v-installed">–</dd>
+        <dt>Sending</dt><dd id="v-sending">–</dd>
+      </dl>
+      <div class="row-buttons">
+        <button id="v-install" class="primary" title="One administrator (UAC) prompt">Install for all programs</button>
+        <button id="v-install-user" title="No administrator rights; some programs may not see it">Install for this user only</button>
+        <button id="v-uninstall" hidden>Remove</button>
+      </div>
+      <div id="v-error" class="banner error" hidden></div>
+      <ol class="steps">
+        <li>OBS: <b>remove or deactivate</b> the Video Capture Device source that uses your capture card (only one program can open it).</li>
+        <li>Choose the card in <i>Device</i> on the left and press <b>Start</b>.</li>
+        <li>OBS: <i>Sources › + › Video Capture Device › Device: <b>USC Virtual Camera</b></i>. Same picture, no Game Capture.</li>
+        <li>TikTok Studio (or any app): choose the camera <b>USC Virtual Camera</b>.</li>
+        <li>Sound: the card's audio is a separate Windows audio device. Add it in OBS as <i>Audio Input Capture</i> (it is not locked by the video).</li>
+      </ol>
+      <p class="hint">Visible to programs that use DirectShow cameras: OBS, Chromium/Electron apps (TikTok LIVE Studio, Chrome, Edge, Discord), Zoom and most desktop apps.
+        Not visible to the Windows Camera app and other Store (WinRT) apps.</p>
+    </section>
+
+    <details class="card alt">
+      <summary>Alternative: keep the card in OBS and send OBS's output (OBS Virtual Camera)</summary>
+    <section class="feed" aria-labelledby="feed-title">
+      <div class="feed-head">
+        <h4 id="feed-title">TikTok Studio feed via OBS</h4>
         <span id="feed-pill" class="pill">…</span>
       </div>
       <p class="hint">OBS keeps your capture card as a normal <b>Video Capture Device</b> (direct, no Game Capture).
@@ -109,8 +142,9 @@
       </ol>
       <p class="hint">Needs OBS's WebSocket server (Tools › WebSocket Server Settings). The connection settings are in the chat Settings › Advanced › OBS.</p>
     </section>
+    </details>
 
-    <h3 class="section-title">Advanced: direct relay window <small>(opens the device itself - only for a card OBS does not use)</small></h3>
+    <h3 class="section-title">Capture status</h3>
     <div id="banner" class="banner" hidden></div>
 
     <div class="grid">
@@ -131,8 +165,9 @@
         </dl>
       </div>
       <div class="card">
-        <h4>Output window</h4>
+        <h4>Outputs</h4>
         <dl>
+          <dt>Virtual camera</dt><dd id="w-vcam">–</dd>
           <dt>Window</dt><dd id="w-state">–</dd>
           <dt>Frames</dt><dd id="w-frames">–</dd>
           <dt>Not shown</dt><dd id="w-dropped">–</dd>

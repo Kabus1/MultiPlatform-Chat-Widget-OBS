@@ -79,6 +79,11 @@ json Settings::defaults() {
             {"outputFps", 0},               // 0 = match source, else a cap
             {"keepAspect", true},
             {"windowTitle", "USC Capture Output"},
+            // Outputs: "USC Virtual Camera" (OBS Video Capture Device, TikTok
+            // Studio, browsers... - no window, no Game Capture) and/or the
+            // older Game-Capturable output window.
+            {"virtualCam", true},
+            {"outputWindow", false},
         }},
         {"tiktok", {
             {"enabled", false},

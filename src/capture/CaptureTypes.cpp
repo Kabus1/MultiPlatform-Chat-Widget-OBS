@@ -1,5 +1,7 @@
 #include "capture/CaptureTypes.hpp"
 
+#include <cctype>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -51,6 +53,8 @@ RelayConfig RelayConfig::fromJson(const json& j) {
     c.outputFps = getInt(j, "outputFps", 0);
     c.keepAspect = getBool(j, "keepAspect", true);
     c.windowTitle = getStr(j, "windowTitle", "USC Capture Output");
+    c.virtualCam = getBool(j, "virtualCam", true);
+    c.outputWindow = getBool(j, "outputWindow", false);
     if (c.windowTitle.empty()) c.windowTitle = "USC Capture Output";
     return c;
 }
@@ -58,7 +62,26 @@ RelayConfig RelayConfig::fromJson(const json& j) {
 bool RelayConfig::sameSession(const RelayConfig& o) const {
     return enabled == o.enabled && deviceId == o.deviceId && mode == o.mode &&
            outputResolution == o.outputResolution && outputFps == o.outputFps && keepAspect == o.keepAspect &&
-           windowTitle == o.windowTitle;
+           windowTitle == o.windowTitle && virtualCam == o.virtualCam && outputWindow == o.outputWindow;
+}
+
+bool isOwnVirtualCamera(const std::string& name) { return name == "USC Virtual Camera"; }
+
+bool isVirtualDevice(const std::string& link, const std::string& name) {
+    std::string l, n;
+    for (char c : link) l += char(std::tolower(static_cast<unsigned char>(c)));
+    for (char c : name) n += char(std::tolower(static_cast<unsigned char>(c)));
+    return l.rfind("\\\\?\\swd#", 0) == 0 || n.find("virtual") != std::string::npos || isOwnVirtualCamera(name);
+}
+
+CaptureError classifyCaptureError(const std::string& m) {
+    auto has = [&](const char* code) { return m.find(code) != std::string::npos; };
+    // MF_E_HW_MFT_FAILED_START_STREAMING, MF_E_VIDEO_RECORDING_DEVICE_LOCKED,
+    // MF_E_VIDEO_RECORDING_DEVICE_PREEMPTED: another program owns the device.
+    if (has("0xC00D3704") || has("0xC00D3EA2") || has("0xC00D3EA3")) return CaptureError::Busy;
+    if (has("0x80070005")) return CaptureError::Privacy; // E_ACCESSDENIED
+    if (has("0xC00D3E85")) return CaptureError::Gone;    // MF_E_VIDEO_RECORDING_DEVICE_INVALIDATED
+    return CaptureError::Other;
 }
 
 int subtypeCost(const std::string& s) {

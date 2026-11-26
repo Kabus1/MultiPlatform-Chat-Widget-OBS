@@ -98,3 +98,7 @@ dd { margin: 0; font-variant-numeric: tabular-nums; }
 .section-title small { text-transform: none; letter-spacing: 0; font-weight: 400; }
 .pill.ok { background: rgba(34,197,94,.18); color: var(--ok); }
 .pill.warn { background: rgba(245,158,11,.18); color: var(--warn); }
+
+details.alt > summary { cursor: pointer; font-size: 13px; color: var(--fg-dim); padding: 2px 0; }
+details.alt[open] > summary { margin-bottom: 8px; }
+.side label.check { margin-bottom: 6px; }

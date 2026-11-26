@@ -46,7 +46,7 @@
     for (const d of devs) {
       const selected = d.id === cfg.deviceId || (!found && cfg.deviceName && d.name === cfg.deviceName);
       if (selected) found = true;
-      opts.push(`<option value="${esc(d.id)}"${selected ? ' selected' : ''}>${esc(d.name)}</option>`);
+      opts.push(`<option value="${esc(d.id)}"${selected ? ' selected' : ''}>${esc(d.name)}${d.virtual ? ' (virtual camera)' : ''}</option>`);
     }
     if (!found && cfg.deviceId)
       opts.push(`<option value="${esc(cfg.deviceId)}" selected>${esc(cfg.deviceName || 'Saved device')} (not connected)</option>`);
@@ -118,6 +118,8 @@
     if (document.activeElement !== $('#out-res')) $('#out-res').value = cfg.outputResolution || 'source';
     if (document.activeElement !== $('#out-fps')) $('#out-fps').value = String(cfg.outputFps || 0);
     $('#keep-aspect').checked = cfg.keepAspect !== false;
+    $('#out-vcam').checked = cfg.virtualCam !== false;
+    $('#out-window').checked = cfg.outputWindow === true;
     $('#auto-start').checked = cfg.autoStart === true;
     if (document.activeElement !== $('#title')) $('#title').value = cfg.windowTitle || 'USC Capture Output';
     $('#title-code').textContent = `[UnifiedStreamChat.exe]: ${cfg.windowTitle || 'USC Capture Output'}`;
@@ -164,7 +166,7 @@
     else if (st.state === 'error') banner('error', st.detail);
     else if (st.window && st.window.error) banner('error', 'Output window: ' + st.window.error);
     else if (st.state === 'no-signal') banner('warn', st.detail);
-    else if (st.state === 'running' && st.window && st.window.minimized)
+    else if (st.state === 'running' && st.window && st.window.open && st.window.minimized)
       banner('warn', 'The output window is minimized - OBS Game Capture shows nothing while it is. Restore it (it can stay behind other windows).');
     else if (st.state === 'starting') banner('info', st.detail || 'Starting…');
     else if (st.state === 'off' && st.detail) banner('info', st.detail);
@@ -184,7 +186,12 @@
     $('#m-cap').textContent = live ? (o.fpsCap ? `${fmtFps(o.fpsCap)} fps` : 'none (source rate)') : '–';
     $('#m-outfps').textContent = live ? fmtFps(meas.outputFps || 0) : '–';
     const w = st.window || {};
-    $('#w-state').textContent = !w.open ? 'closed' : w.minimized ? 'minimized ⚠' : w.visible ? 'open, capturable' : 'hidden ⚠';
+    const outs = st.outputs || {};
+    const vc = outs.virtualCam || {};
+    $('#w-vcam').textContent = !vc.enabled ? 'off' : vc.open ? `sending (${fmtFps(vc.fps || 0)} fps, ${vc.frames || 0} frames)` : 'idle';
+    $('#w-state').textContent = !(outs.window || {}).enabled ? 'off'
+      : !w.open ? 'closed' : w.minimized ? 'minimized ⚠' : w.visible ? 'open, capturable' : 'hidden ⚠';
+    renderVcam();
     $('#w-frames').textContent = live ? `${meas.presented || 0} shown / ${meas.frames || 0} received` : '–';
     $('#w-dropped').textContent = live
       ? `${meas.failed || 0} failed · ${meas.skipped || 0} replaced by a newer frame · ${meas.paced || 0} by FPS cap`
@@ -261,6 +268,8 @@
   $('#out-res').addEventListener('change', (e) => save({ outputResolution: e.target.value }));
   $('#out-fps').addEventListener('change', (e) => save({ outputFps: Number(e.target.value) }));
   $('#keep-aspect').addEventListener('change', (e) => save({ keepAspect: e.target.checked }));
+  $('#out-vcam').addEventListener('change', (e) => save({ virtualCam: e.target.checked }));
+  $('#out-window').addEventListener('change', (e) => save({ outputWindow: e.target.checked }));
   $('#auto-start').addEventListener('change', (e) => save({ autoStart: e.target.checked }));
   $('#title').addEventListener('change', (e) => {
     const t = e.target.value.trim() || 'USC Capture Output';
@@ -273,6 +282,59 @@
     if (document.visibilityState === 'visible') api('/api/capture/devices/refresh', { method: 'POST' }).catch(() => {});
     updatePreviewLoop();
   });
+
+  // ------------------------------------------------------------- USC Virtual Camera
+  let vcam = null;
+  function renderVcam() {
+    if (!vcam) return;
+    const pill = $('#vcam-pill');
+    const vc = (st && st.outputs && st.outputs.virtualCam) || {};
+    const sending = !!vc.open;
+    if (!vcam.supported) {
+      pill.textContent = 'Windows only';
+      pill.className = 'pill';
+    } else if (!vcam.installed) {
+      pill.textContent = 'Not installed';
+      pill.className = 'pill warn';
+    } else {
+      pill.textContent = sending ? 'Sending' : 'Installed';
+      pill.className = 'pill ' + (sending ? 'ok' : 'running');
+    }
+    $('#v-installed').textContent = !vcam.supported ? 'available on Windows only'
+      : !vcam.dllFound ? 'usc_vcam.dll is missing next to the app - reinstall the app'
+      : vcam.machineRegistered ? 'yes, for all programs' + (vcam.pathMatches ? '' : ' (points to another copy - install again)')
+      : vcam.userRegistered ? 'for this user only' + (vcam.pathMatches ? '' : ' (points to another copy - install again)')
+      : 'no';
+    $('#v-sending').textContent = sending
+      ? `${(st.output || {}).width}×${(st.output || {}).height} at ${fmtFps(vc.fps || 0)} fps`
+      : st && st.state === 'running' ? 'the camera output is off (Output on the left)'
+      : 'not sending - choose your capture device and press Start (camera apps show a dark "no signal" picture)';
+    $('#v-install').disabled = $('#v-install-user').disabled = !vcam.supported || !vcam.dllFound;
+    $('#v-uninstall').hidden = !vcam.installed;
+  }
+  async function vcamAction(path, label) {
+    const err = $('#v-error');
+    err.hidden = true;
+    const btns = ['#v-install', '#v-install-user', '#v-uninstall'].map((b) => $(b));
+    btns.forEach((b) => (b.disabled = true));
+    $('#v-installed').textContent = label;
+    try {
+      const res = await fetch(path, { method: 'POST', headers: { 'X-USC': '1' } });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data.ok === false) throw new Error(data.error || res.statusText);
+      vcam = data;
+    } catch (e) {
+      err.hidden = false;
+      err.textContent = e.message;
+      vcam = await api('/api/vcam/status').catch(() => vcam);
+    }
+    btns.forEach((b) => (b.disabled = false));
+    renderVcam();
+  }
+  $('#v-install').addEventListener('click', () => vcamAction('/api/vcam/install?scope=machine', 'Waiting for the administrator prompt…'));
+  $('#v-install-user').addEventListener('click', () => vcamAction('/api/vcam/install?scope=user', 'Installing…'));
+  $('#v-uninstall').addEventListener('click', () =>
+    vcamAction('/api/vcam/uninstall?scope=' + (vcam && vcam.machineRegistered ? 'machine' : 'user'), 'Removing…'));
 
   // ------------------------------------------------------------- TikTok feed (OBS)
   let feed = null;
@@ -317,12 +379,14 @@
       if (s.ui && s.ui.theme && s.ui.theme !== 'transparent') document.documentElement.dataset.theme = s.ui.theme;
       st = await api('/api/capture/status');
       feed = await api('/api/camfeed/status');
+      vcam = await api('/api/vcam/status');
     } catch (e) {
       banner('error', 'The app is not reachable: ' + e.message);
     }
     renderSidebar();
     renderStatus();
     renderFeed();
+    renderVcam();
     showPreview('');
 
     const es = new EventSource('/api/events');

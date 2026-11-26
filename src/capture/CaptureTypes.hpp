@@ -16,7 +16,23 @@ namespace usc::capture {
 struct Device {
     std::string id;   // symbolic link (stable across restarts / USB ports)
     std::string name; // friendly name, e.g. "Game Capture 4K60 Pro MK.2"
+    bool isVirtual = false; // software camera (not a capture card / webcam)
 };
+
+// Software cameras by their Media Foundation symbolic link ("\\?\swd#..."
+// = software device) or name. Our own "USC Virtual Camera" is never listed
+// as an input (it would feed itself).
+bool isVirtualDevice(const std::string& symbolicLink, const std::string& name);
+bool isOwnVirtualCamera(const std::string& name);
+
+// What a capture error means for the relay.
+enum class CaptureError {
+    Other,   // retry with back-off
+    Busy,    // another program has the device (0xC00D3704 ...): never retry by itself
+    Privacy, // Windows camera privacy blocks desktop apps: the user must change it
+    Gone,    // unplugged / driver reset: retry (it may come back)
+};
+CaptureError classifyCaptureError(const std::string& message);
 
 // One mode the hardware itself offers (from the device's native media types).
 struct Mode {
@@ -45,6 +61,8 @@ struct RelayConfig {
     int outputFps = 0;                    // 0 = match source; otherwise a cap (60, 100, 120, 144...)
     bool keepAspect = true;               // letterbox instead of stretching
     std::string windowTitle = "USC Capture Output";
+    bool virtualCam = true;    // publish to "USC Virtual Camera" (any program opens it)
+    bool outputWindow = false; // also show the Game-Capturable output window
 
     static RelayConfig fromJson(const nlohmann::json& j);
     bool sameSession(const RelayConfig& o) const; // would a restart be needed?

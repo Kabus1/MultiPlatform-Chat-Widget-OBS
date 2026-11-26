@@ -2,6 +2,8 @@
 #include "capture/CaptureRelay.hpp"
 #include "capture/CaptureTypes.hpp"
 #include "capture/Guard.hpp"
+#include "vcam/VcamFrame.hpp"
+#include "vcam/VcamShared.hpp"
 #include "core/App.hpp"
 #include "core/EventHub.hpp"
 #include "integrations/ObsCameraFeed.hpp"
@@ -886,6 +888,144 @@ void testObsFeedHelpers() {
     CHECK(!c.enabled && c.sceneName == "USC TikTok Feed" && c.autoStartVirtualCam);
 }
 
+void testVirtualCamera() {
+    using namespace usc::vcam;
+    // --- pixel work ---
+    CHECK(frameBytes(PixelFormat::NV12, 1920, 1080) == 1920 * 1080 * 3 / 2);
+    CHECK(frameBytes(PixelFormat::YUY2, 1280, 720) == 1280 * 720 * 2);
+    CHECK(frameBytes(PixelFormat::I420, 0, 10) == 0);
+
+    // Padded NV12 (pitch 8, UV after 6 padded rows) -> packed 4x4.
+    std::vector<uint8_t> padded(8 * 6 + 8 * 2, 0);
+    for (int y = 0; y < 4; ++y)
+        for (int x = 0; x < 4; ++x) padded[size_t(y) * 8 + x] = uint8_t(10 * y + x);
+    for (int y = 0; y < 2; ++y)
+        for (int x = 0; x < 4; ++x) padded[8 * 6 + size_t(y) * 8 + x] = uint8_t(100 + 10 * y + x);
+    std::vector<uint8_t> packed(frameBytes(PixelFormat::NV12, 4, 4));
+    packNV12(padded.data(), 8, 8 * 6, 4, 4, packed.data());
+    CHECK(packed[5] == 11 && packed[15] == 33 && packed[16] == 100 && packed[23] == 113);
+
+    // YUY2 -> NV12 -> YUY2 round trip on a flat frame.
+    std::vector<uint8_t> yuy2(4 * 2 * 2);
+    for (size_t i = 0; i < yuy2.size(); i += 4) { yuy2[i] = 50; yuy2[i + 1] = 60; yuy2[i + 2] = 70; yuy2[i + 3] = 80; }
+    std::vector<uint8_t> nv(frameBytes(PixelFormat::NV12, 4, 2)), back(yuy2.size());
+    yuy2ToNV12(yuy2.data(), 8, 4, 2, nv.data());
+    CHECK(nv[0] == 50 && nv[1] == 70 && nv[8] == 60 && nv[9] == 80);
+    convertFromNV12(nv.data(), 4, 2, PixelFormat::YUY2, back.data());
+    CHECK(back == yuy2);
+    std::vector<uint8_t> i420(frameBytes(PixelFormat::I420, 4, 2));
+    convertFromNV12(nv.data(), 4, 2, PixelFormat::I420, i420.data());
+    CHECK(i420[8] == 60 && i420[9] == 60 && i420[10] == 80 && i420[11] == 80);
+
+    // Scaling: exact 2:1 box, bilinear, copy; flat input stays flat.
+    auto flat = [](int w, int h, uint8_t yv, uint8_t uv) {
+        std::vector<uint8_t> f(frameBytes(PixelFormat::NV12, w, h), uv);
+        std::fill(f.begin(), f.begin() + size_t(w) * h, yv);
+        return f;
+    };
+    auto src = flat(3840, 2160, 120, 77);
+    std::vector<uint8_t> hd(frameBytes(PixelFormat::NV12, 1920, 1080));
+    scaleNV12(src.data(), 3840, 2160, hd.data(), 1920, 1080);
+    CHECK(hd[0] == 120 && hd[1920 * 1080 - 1] == 120 && hd[1920 * 1080] == 77 && hd.back() == 77);
+    std::vector<uint8_t> odd(frameBytes(PixelFormat::NV12, 1280, 720));
+    scaleNV12(hd.data(), 1920, 1080, odd.data(), 1280, 720);
+    CHECK(odd[640 * 360] == 120 && odd.back() == 77);
+    // A left/right split keeps its sides after bilinear scaling.
+    auto split = flat(16, 4, 0, 128);
+    for (int y = 0; y < 4; ++y)
+        for (int x = 8; x < 16; ++x) split[size_t(y) * 16 + x] = 200;
+    std::vector<uint8_t> small(frameBytes(PixelFormat::NV12, 6, 2));
+    scaleNV12(split.data(), 16, 4, small.data(), 6, 2);
+    CHECK(small[0] == 0 && small[5] == 200);
+
+    // BGR preview: limited-range black / white / grey.
+    std::vector<uint8_t> px = flat(2, 2, 16, 128), bgr(12);
+    nv12ToBgr24(px.data(), 2, 2, bgr.data());
+    CHECK(bgr[0] == 0 && bgr[1] == 0 && bgr[2] == 0);
+    px = flat(2, 2, 235, 128);
+    nv12ToBgr24(px.data(), 2, 2, bgr.data());
+    CHECK(bgr[0] == 255 && bgr[1] == 255 && bgr[2] == 255);
+
+    std::vector<uint8_t> ph(frameBytes(PixelFormat::YUY2, 4, 2));
+    fillPlaceholder(PixelFormat::YUY2, 4, 2, ph.data());
+    CHECK(ph[0] == 40 && ph[1] == 136 && ph[3] == 124);
+
+    // --- shared memory protocol ---
+    std::vector<uint8_t> region(kRegionBytes, 0xEE); // garbage until init
+    FrameWriter writer(region.data());
+    FrameReader reader(region.data());
+    CHECK(!reader.valid() || !reader.writerAlive(1000));
+    writer.init(42);
+    CHECK(reader.valid() && !reader.writerAlive(1000)); // no frame yet
+    writer.setFormat(1920, 1080, 60, 1);
+    uint32_t w = 0, h = 0, fn = 0, fd = 0;
+    CHECK(reader.format(w, h, fn, fd) && w == 1920 && h == 1080 && fn == 60 && fd == 1);
+    std::vector<uint8_t> out(kSlotBytes);
+    int rw = 0, rh = 0;
+    uint64_t n = 0;
+    CHECK(!reader.readLatest(out.data(), out.size(), rw, rh, n)); // nothing published
+    for (int i = 0; i < 5; ++i) {
+        uint8_t* slot = writer.begin(64, 32);
+        std::memset(slot, 10 + i, frameBytes(PixelFormat::NV12, 64, 32));
+        writer.commit(i * 1000, 5000 + i);
+    }
+    CHECK(reader.writerAlive(5004) && !reader.writerAlive(5004 + kWriterTimeoutMs + 1));
+    CHECK(reader.readLatest(out.data(), out.size(), rw, rh, n) && rw == 64 && rh == 32 && n == 5 && out[0] == 14);
+    CHECK(!reader.readLatest(out.data(), 100, rw, rh, n)); // does not fit: refused
+    CHECK(!writer.begin(5000, 10));                        // larger than 4K: refused
+    // A slot being written (odd sequence) is never handed out half-done.
+    uint8_t* slot = writer.begin(64, 32);
+    std::memset(slot, 99, 16);
+    CHECK(reader.readLatest(out.data(), out.size(), rw, rh, n) && out[0] == 14); // still the last complete frame
+    writer.commit(0, 6000);
+    CHECK(reader.readLatest(out.data(), out.size(), rw, rh, n) && n == 6 && out[0] == 99);
+    // Concurrent writer + reader: every frame read is internally consistent.
+    std::atomic<bool> stopWriter{false};
+    std::thread wt([&] {
+        for (int i = 0; !stopWriter; ++i) {
+            uint8_t* s2 = writer.begin(320, 180);
+            std::memset(s2, i & 0xFF, frameBytes(PixelFormat::NV12, 320, 180));
+            writer.commit(i, 7000);
+        }
+    });
+    int consistent = 0, torn = 0;
+    // Wait until the writer thread really produces, then read for a while.
+    for (int i = 0; i < 500 && reader.frameCounter() < 20; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(300);
+    while (std::chrono::steady_clock::now() < until)
+        if (reader.readLatest(out.data(), out.size(), rw, rh, n) && n > 6) { // frames of this writer thread
+            size_t bytes = frameBytes(PixelFormat::NV12, rw, rh);
+            bool same = std::all_of(out.begin(), out.begin() + bytes, [&](uint8_t v) { return v == out[0]; });
+            (same ? consistent : torn)++;
+        }
+    stopWriter = true;
+    wt.join();
+    CHECK(torn == 0 && consistent > 0);
+    // Writer leaves: readers show "no signal"; a restarted writer keeps readers' mapping valid.
+    writer.detach();
+    CHECK(!reader.writerAlive(7000));
+    FrameWriter again(region.data());
+    again.init(43);
+    CHECK(reader.valid() && reader.frameCounter() > 6); // state kept for open readers
+
+    // --- relay decisions ---
+    using usc::capture::CaptureError;
+    using usc::capture::classifyCaptureError;
+    CHECK(classifyCaptureError("The device is in use (0xC00D3704)") == CaptureError::Busy);
+    CHECK(classifyCaptureError("stopped delivering video (0xC00D3EA3)") == CaptureError::Busy);
+    CHECK(classifyCaptureError("blocked camera access (0x80070005)") == CaptureError::Privacy);
+    CHECK(classifyCaptureError("disconnected (0xC00D3E85)") == CaptureError::Gone);
+    CHECK(classifyCaptureError("whatever") == CaptureError::Other);
+    CHECK(usc::capture::isVirtualDevice("\\\\?\\SWD#VCAMDEVAPI#abc", "Some Cam"));
+    CHECK(usc::capture::isVirtualDevice("\\\\?\\usb#vid_0fd9", "OBS Virtual Camera"));
+    CHECK(!usc::capture::isVirtualDevice("\\\\?\\usb#vid_0fd9&pid_009b", "Elgato 4K S"));
+    CHECK(usc::capture::isOwnVirtualCamera("USC Virtual Camera"));
+    auto rc = usc::capture::RelayConfig::fromJson(nlohmann::json::object());
+    CHECK(rc.virtualCam && !rc.outputWindow);
+    auto rc2 = usc::capture::RelayConfig::fromJson({{"virtualCam", false}, {"outputWindow", true}});
+    CHECK(!rc2.virtualCam && rc2.outputWindow && !rc.sameSession(rc2));
+}
+
 int main() {
     testTwitchParse();
     testKickParse();
@@ -910,6 +1050,7 @@ int main() {
     testSpeechQueue();
     testDisplayFirstPipeline();
     testObsFeedHelpers();
+    testVirtualCamera();
     if (failures) {
         std::cerr << failures << " check(s) failed\n";
         return 1;

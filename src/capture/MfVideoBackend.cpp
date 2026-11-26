@@ -347,7 +347,14 @@ public:
             // Reading attributes does not activate (open) the device.
             if (SUCCEEDED(devices[i]->GetAllocatedString(MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME, &name, &len)) &&
                 SUCCEEDED(devices[i]->GetAllocatedString(MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK, &link, &len)))
-                out.push_back({narrow(link), narrow(name)});
+            {
+                Device d{narrow(link), narrow(name), false};
+                d.isVirtual = isVirtualDevice(d.id, d.name);
+                // Our own camera must never become the relay's input (it would
+                // feed itself). It is a DirectShow camera, so Media Foundation
+                // normally does not list it anyway.
+                if (!isOwnVirtualCamera(d.name)) out.push_back(std::move(d));
+            }
             CoTaskMemFree(name);
             CoTaskMemFree(link);
             devices[i]->Release();

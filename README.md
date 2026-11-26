@@ -238,7 +238,37 @@ The app connects to OBS's own WebSocket server (OBS 28+, *Tools → WebSocket Se
 - **It reacts to "stream started".** When OBS starts streaming (`StreamStateChanged`), YouTube and TikTok check right away and keep checking every 15 s for 3 minutes until the stream shows as live. Nothing needs to poll often while you are offline.
 - **It stays quiet when OBS is closed.** It retries every 30 s at most and only reports when its status changes.
 
-### TikTok Studio feed via OBS (recommended for a capture card)
+### USC Virtual Camera (recommended for a capture card)
+**What Windows allows:**
+- A capture card (Elgato etc.) can be opened by **one program at a time**. The second one gets `0xC00D3704` ("in use").
+- Windows 11's camera sharing (Frame Server) can let several apps share some *webcams*. Capture cards opened by OBS through DirectShow normally stay exclusive.
+- A *virtual camera* is different: it is a piece of software that every program loads for itself. Any number of programs can use it at once.
+
+**How the app uses this:**
+- The app opens the card **once** and publishes it as **USC Virtual Camera**, a DirectShow camera (`usc_vcam.dll`, next to the app).
+- Frames go through shared memory as uncompressed NV12, so the delay is about one frame. There is no window and no Game Capture.
+- OBS adds it as a normal **Video Capture Device**, and TikTok Studio, browsers, Discord, Zoom… pick it as a camera, all at the same time.
+
+**Setup:**
+1. On the 🎥 page, press **Install for all programs** (one administrator prompt; `regsvr32 usc_vcam.dll`). *Install for this user only* needs no administrator rights, but some programs may not see a per-user camera.
+2. In OBS, remove or deactivate the Video Capture Device source that holds the card.
+3. Choose the card on the left and press **Start**.
+4. In OBS: *Sources › + › Video Capture Device › Device: USC Virtual Camera*. In TikTok Studio, choose the camera **USC Virtual Camera**.
+5. Sound: the card's audio is a separate Windows audio device and is not locked by the video. Add it in OBS as *Audio Input Capture*.
+
+**Details:**
+- **Formats offered:** the output size and rate from the left panel, plus common smaller sizes. NV12, YUY2 and I420 are available; the camera scales and converts per program.
+- **When the app is not sending:** programs see a dark "no signal" picture and keep running.
+- **Which programs see it:** programs that use DirectShow cameras (OBS, Chromium/Electron apps, most desktop apps). The Windows Camera app and Store (WinRT) apps don't see DirectShow cameras.
+- **Bitness:** the camera is 64-bit, so 32-bit programs won't see it.
+- **When the card is busy:** if another program already has the card (`0xC00D3704`), the app stops at once with an explanation. It does not retry in a loop and does not retry at the next launch.
+- **Testing:** `usc_vcam_test.exe` (built with the tests) registers the camera, opens it from two DirectShow graphs at once and checks the frames.
+
+**Why not OBS Virtual Camera:**
+- It is a DirectShow camera too, so it never appears in the app's Media Foundation device list.
+- It sends OBS's composited output at OBS's canvas rate, after OBS has rendered it. That adds delay compared to the raw card frames.
+
+### TikTok Studio feed via OBS (alternative: OBS keeps the card)
 A capture card (Elgato etc.) can be opened by only one program at a time. That program locks the others out, whichever starts first. The clean setup has **one owner, OBS**:
 
 - OBS keeps the card as a direct **Video Capture Device** source, so recording and preview are untouched. There is no Game Capture of another window, which was the cause of the stutter.

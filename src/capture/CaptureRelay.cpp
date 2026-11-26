@@ -31,7 +31,7 @@ constexpr int kRetryMaxMs = 30000;
 CaptureRelay::CaptureRelay(std::function<void(const json&)> onStatus, std::function<void()> onDisabled,
                            std::string markerPath)
     : onStatus_(std::move(onStatus)), onDisabled_(std::move(onDisabled)), markerPath_(std::move(markerPath)),
-      backend_(createVideoBackend()), output_(createOutputSink()) {
+      backend_(createVideoBackend()), output_(createOutputSink()), vcam_(createVirtualCamSink()) {
     // The window thread only queues a command: it must never wait on the
     // worker, which joins the window thread when it closes the output.
     output_->onUserClosed([this] { push({CmdType::UserClosed, {}, ""}); });
@@ -152,8 +152,12 @@ json CaptureRelay::modes(const std::string& deviceId) {
 }
 
 std::optional<std::string> CaptureRelay::preview() {
-    output_->requestPreview();
-    return output_->previewJpeg();
+    if (windowOpen_) {
+        output_->requestPreview();
+        return output_->previewJpeg();
+    }
+    vcam_->requestPreview(); // made from the published frames, 5 fps at most
+    return vcam_->previewJpeg();
 }
 
 json CaptureRelay::status() const {
@@ -163,7 +167,8 @@ json CaptureRelay::status() const {
 
 json CaptureRelay::snapshotLocked() const {
     json j;
-    j["supported"] = backend_->supported() && output_->supported();
+    j["supported"] = backend_->supported() && (output_->supported() || vcam_->supported());
+    j["deviceBusy"] = deviceBusy_;
     j["enabled"] = cfg_.enabled;
     j["state"] = state_;
     j["detail"] = detail_;
@@ -178,13 +183,19 @@ json CaptureRelay::snapshotLocked() const {
     j["deliveredFormat"] = delivered_ ? delivered_->subtype : "";
     j["output"] = {{"width", outW_}, {"height", outH_}, {"fpsCap", fpsCap_}, {"title", cfg_.windowTitle}};
     OutputState os = output_->state();
+    const bool win = windowOpen_, cam = vcamOpen_;
+    const uint64_t camFrames = vcam_->framesWritten();
+    const double camFps = vcam_->fps();
+    j["outputs"] = {{"virtualCam", {{"enabled", cfg_.virtualCam}, {"open", cam}, {"frames", camFrames},
+                                    {"fps", std::round(camFps * 10) / 10}}},
+                    {"window", {{"enabled", cfg_.outputWindow}, {"open", win}}}};
     {
         std::lock_guard<std::mutex> s(statsMutex_);
         int64_t now = util::nowMs();
         j["measured"] = {{"captureFps", std::round(captureRate_.rate(now) * 10) / 10},
-                         {"outputFps", std::round(os.fps * 10) / 10},
+                         {"outputFps", std::round((win ? os.fps : camFps) * 10) / 10},
                          {"frames", frames_},          // received from the device
-                         {"presented", os.presented},  // drawn + presented (what OBS sees)
+                         {"presented", win ? os.presented : camFrames}, // drawn / published
                          {"skipped", os.skipped},      // replaced by a newer frame before drawing
                          {"failed", os.failed + rejected_},
                          {"paced", paced_},            // dropped on purpose by the FPS cap
@@ -192,7 +203,7 @@ json CaptureRelay::snapshotLocked() const {
     }
     j["window"] = {{"open", os.open}, {"visible", os.visible}, {"minimized", os.minimized}, {"error", os.error}};
     j["devices"] = json::array();
-    for (const auto& d : devices_) j["devices"].push_back({{"id", d.id}, {"name", d.name}});
+    for (const auto& d : devices_) j["devices"].push_back({{"id", d.id}, {"name", d.name}, {"virtual", d.isVirtual}});
     j["devicesError"] = devicesError_;
     j["enumerating"] = enumerating_;
     return j;
@@ -307,7 +318,7 @@ void CaptureRelay::handle(const Cmd& c) {
     }
     case CmdType::SessionError:
         stopSession();
-        fail(c.arg, true);
+        failCapture(c.arg);
         return;
     case CmdType::UserClosed:
         stopSession();
@@ -380,7 +391,7 @@ void CaptureRelay::tick() {
             return;
         }
     }
-    if (open) {
+    if (open && windowOpen_) {
         OutputState os = output_->state();
         if (os.faulted) {
             stopSession();
@@ -438,7 +449,9 @@ void CaptureRelay::startSession() {
         note_.clear();
     }
     publish();
-    if (!backend_->supported() || !output_->supported()) {
+    if (!cfg.virtualCam && !cfg.outputWindow)
+        return fail("Turn on an output: USC Virtual Camera and/or the output window", false);
+    if (!backend_->supported() || (!output_->supported() && !vcam_->supported())) {
         std::string e;
         backend_->enumerate(e);
         return fail(e.empty() ? "Video capture is not supported on this system" : e, false);
@@ -478,7 +491,7 @@ void CaptureRelay::startSession() {
 
     std::string error;
     std::vector<Mode> modes = modesFor(id, error);
-    if (modes.empty()) return fail(error.empty() ? "The device reported no video modes" : error, true);
+    if (modes.empty()) return failCapture(error.empty() ? "The device reported no video modes" : error);
     std::string note;
     std::optional<Mode> mode = chooseMode(modes, cfg, note);
     if (!mode) return fail("None of the device's modes can be used", false);
@@ -486,7 +499,20 @@ void CaptureRelay::startSession() {
     // A cap at or above the source rate changes nothing: present every frame.
     double cap = (cfg.outputFps > 0 && cfg.outputFps < mode->fps() - 0.5) ? double(cfg.outputFps) : 0.0;
 
-    if (!output_->open(cfg.windowTitle, outW, outH, cfg.keepAspect, error)) return fail(error, false);
+    if (cfg.outputWindow) {
+        if (!output_->open(cfg.windowTitle, outW, outH, cfg.keepAspect, error)) return fail(error, false);
+        windowOpen_ = true;
+    }
+    if (cfg.virtualCam) {
+        // The camera advertises the output size and rate (the cap, else the mode's).
+        uint32_t fn = cap > 0 ? uint32_t(cap) : mode->fpsNum, fd = cap > 0 ? 1 : mode->fpsDen;
+        if (!vcam_->open(outW, outH, fn, fd, error)) {
+            output_->close();
+            windowOpen_ = false;
+            return fail(error, false);
+        }
+        vcamOpen_ = true;
+    }
     {
         std::lock_guard<std::mutex> s(statsMutex_);
         pacer_.reset(cap);
@@ -500,9 +526,10 @@ void CaptureRelay::startSession() {
         id, *mode, [this](const FrameView& f) { onFrame(f); },
         [this](const std::string& msg) { push({CmdType::SessionError, {}, msg}); }, delivered, error);
     if (!ok) {
+        windowOpen_ = vcamOpen_ = false;
         output_->close();
-        // "In use" / privacy / unplugged can change by themselves: retry.
-        return fail(error, true);
+        vcam_->close();
+        return failCapture(error);
     }
     {
         std::lock_guard<std::mutex> lock(stateMutex_);
@@ -518,6 +545,7 @@ void CaptureRelay::startSession() {
         state_ = "running";
         detail_ = "";
         failures_ = 0;
+        deviceBusy_ = false;
     }
     LOG_INFO("capture", "relay running: ", mode->key(), " -> ", outW, "x", outH,
              cap > 0 ? " capped at " + std::to_string(int(cap)) + " fps" : std::string());
@@ -530,9 +558,11 @@ void CaptureRelay::stopSession() {
         wasOpen = sessionOpen_;
         sessionOpen_ = false;
     }
-    // Order matters: stop frame delivery before the window/GPU go away.
+    // Order matters: stop frame delivery before the outputs go away.
     backend_->close();
+    windowOpen_ = vcamOpen_ = false;
     output_->close();
+    vcam_->close(); // camera users see the "no signal" picture
     setMarker(false);
     std::lock_guard<std::mutex> lock(stateMutex_);
     selected_.reset();
@@ -545,6 +575,26 @@ void CaptureRelay::stopSession() {
         state_ = "off";
         if (wasOpen) detail_.clear();
     }
+}
+
+void CaptureRelay::failCapture(const std::string& msg) {
+    CaptureError kind = classifyCaptureError(msg);
+    if (kind != CaptureError::Busy && kind != CaptureError::Privacy) return fail(msg, true);
+    std::string name;
+    {
+        std::lock_guard<std::mutex> lock(stateMutex_);
+        name = cfg_.deviceName.empty() ? std::string("The capture device") : "\"" + cfg_.deviceName + "\"";
+        deviceBusy_ = kind == CaptureError::Busy;
+        cfg_.enabled = false; // no retry loop, and no retry at the next launch
+    }
+    if (kind == CaptureError::Busy)
+        fail(name + " is open in another program (probably OBS). Windows gives a capture card to one program at a "
+                    "time. To use it here, remove it from that program (OBS: delete or deactivate its Video Capture "
+                    "Device source), press Start, then add \"USC Virtual Camera\" in OBS and in TikTok Studio.",
+             false);
+    else
+        fail(msg, false);
+    if (onDisabled_) onDisabled_();
 }
 
 void CaptureRelay::fail(const std::string& msg, bool retryable) {
@@ -578,9 +628,10 @@ void CaptureRelay::onFrame(const FrameView& f) {
         if (!show) ++paced_;
     }
     if (!show) return;
-    // Only copies the frame into the output's mailbox; its render thread
-    // draws and presents it (counted in OutputState).
-    if (!output_->present(f)) {
+    // Virtual camera: one copy (plus scaling if asked) into shared memory;
+    // window: a copy into its mailbox, drawn by its own render thread.
+    if (vcamOpen_) vcam_->push(f);
+    if (windowOpen_ && !output_->present(f)) {
         std::lock_guard<std::mutex> s(statsMutex_);
         ++rejected_;
     }
